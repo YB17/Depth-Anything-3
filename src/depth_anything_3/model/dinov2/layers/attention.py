@@ -9,8 +9,15 @@
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
 import logging
+from typing import Optional
+
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+from depth_anything_3.model.lora.token_selective_lora import (
+    TokenSelectiveLoRALinear,
+    wrap_linear_with_tslora,
+)
 
 logger = logging.getLogger("dinov2")
 
@@ -28,6 +35,7 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        tslora_cfg: Optional[dict] = None,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -44,11 +52,27 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+        # Token-selective LoRA wrappers.
+        tslora_cfg = tslora_cfg or {}
+        enable_tslora = tslora_cfg.get("enable", False)
+        apply_to = {s.lower() for s in tslora_cfg.get("apply_to", [])}
+        rank = tslora_cfg.get("rank", 4)
+        alpha = tslora_cfg.get("alpha", 1.0)
+        if enable_tslora and ({"q", "k", "v", "qkv"} & apply_to):
+            self.qkv = wrap_linear_with_tslora(self.qkv, rank=rank, alpha=alpha, enable=True)
+        if enable_tslora and ("proj" in apply_to):
+            self.proj = wrap_linear_with_tslora(self.proj, rank=rank, alpha=alpha, enable=True)
+
+    def forward(
+        self, x: Tensor, pos=None, attn_mask=None, token_mask: Optional[Tensor] = None
+    ) -> Tensor:
         B, N, C = x.shape
+        if isinstance(self.qkv, TokenSelectiveLoRALinear):
+            qkv_proj = self.qkv(x, token_mask=token_mask)
+        else:
+            qkv_proj = self.qkv(x)
         qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            qkv_proj.reshape(B, N, 3, self.num_heads, C // self.num_heads)
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -71,12 +95,17 @@ class Attention(nn.Module):
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            if attn_mask is not None:
+                attn = attn.masked_fill(attn_mask[:, None], float("-inf"))
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
+        if isinstance(self.proj, TokenSelectiveLoRALinear):
+            x = self.proj(x, token_mask=token_mask)
+        else:
+            x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
