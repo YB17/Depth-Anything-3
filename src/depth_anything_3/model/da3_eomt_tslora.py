@@ -145,11 +145,13 @@ class DA3EoMTTSLoRANetwork(nn.Module):
         num_seg_queries: int,
         num_blocks: int = 4,
         masked_attn_enabled: bool = True,
+        tslora_cfg: Optional[dict] | None = None,
     ):
         super().__init__()
         self.encoder_fn = encoder_fn
         self.num_blocks = num_blocks
         self.masked_attn_enabled = masked_attn_enabled
+        self.tslora_cfg = tslora_cfg or {}
         self.seg_head = DepthAnything3EoMTTSLoRA(
             num_seg_queries=num_seg_queries,
             embed_dim=embed_dim,
@@ -203,7 +205,13 @@ class SimpleDA3Encoder(nn.Module):
     in.
     """
 
-    def __init__(self, embed_dim: int, num_seg_queries: int, patch_stride: int = 16):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_seg_queries: int,
+        patch_stride: int = 16,
+        tslora_cfg: Optional[dict] | None = None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_seg_queries = num_seg_queries
@@ -211,6 +219,12 @@ class SimpleDA3Encoder(nn.Module):
         self.proj = nn.Conv2d(3, embed_dim, kernel_size=patch_stride, stride=patch_stride)
         self.seg_queries = nn.Embedding(num_seg_queries, embed_dim)
         # Minimal self-attention layer to exercise block masks and token-selective LoRA.
+        tslora_cfg = tslora_cfg or {
+            "enable": True,
+            "apply_to": ["q", "k", "v", "ffn_in", "ffn_out"],
+            "rank": 4,
+            "alpha": 1.0,
+        }
         self.self_attn = Attention(
             embed_dim,
             num_heads=4,
@@ -218,12 +232,7 @@ class SimpleDA3Encoder(nn.Module):
             proj_bias=True,
             attn_drop=0.0,
             proj_drop=0.0,
-            tslora_cfg={
-                "enable": True,
-                "apply_to": ["q", "k", "v", "ffn_in", "ffn_out"],
-                "rank": 4,
-                "alpha": 1.0,
-            },
+            tslora_cfg=tslora_cfg,
         )
 
     def forward(
@@ -265,12 +274,25 @@ def build_da3_eomt_network_from_config(cfg: dict, num_classes: Optional[int] = N
     num_blocks = cfg.get("num_blocks", 4)
     masked_attn = cfg.get("masked_attn_enabled", True)
 
+    tslora_cfg = {
+        "enable": cfg.get("enable_tslora", cfg.get("tslora_enable", False)),
+        "rank": cfg.get("tslora_rank", cfg.get("lora_rank", 4)),
+        "alpha": cfg.get("tslora_alpha", cfg.get("lora_alpha", 1.0)),
+        "apply_to": cfg.get(
+            "tslora_apply_to", cfg.get("lora_apply_to", ["q", "k", "v", "ffn_in", "ffn_out"])
+        ),
+    }
+
     encoder_fn = cfg.get("encoder_fn")
     if isinstance(encoder_fn, str):
         module_name, fn_name = encoder_fn.rsplit(":", 1)
         encoder_fn = getattr(__import__(module_name, fromlist=[fn_name]), fn_name)
     if encoder_fn is None:
-        encoder = SimpleDA3Encoder(embed_dim=embed_dim, num_seg_queries=num_seg_queries)
+        encoder = SimpleDA3Encoder(
+            embed_dim=embed_dim,
+            num_seg_queries=num_seg_queries,
+            tslora_cfg=tslora_cfg,
+        )
         encoder_fn = encoder
 
     if num_classes is None:
@@ -283,12 +305,15 @@ def build_da3_eomt_network_from_config(cfg: dict, num_classes: Optional[int] = N
         num_seg_queries=num_seg_queries,
         num_blocks=num_blocks,
         masked_attn_enabled=masked_attn,
+        tslora_cfg=tslora_cfg,
     )
 
-    return EoMT(
+    model = EoMT(
         encoder=scaffold,  # EoMT expects ``encoder.backbone``; scaffold keeps minimal surface.
         num_classes=num_classes,
         num_q=num_seg_queries,
         num_blocks=num_blocks,
         masked_attn_enabled=masked_attn,
     )
+    model.tslora_cfg = tslora_cfg
+    return model

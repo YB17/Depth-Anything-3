@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 import lightning
 import torch
+from lightning.pytorch.loggers import WandbLogger
 
 from third_party.eomt.training.lightning_module import LightningModule as EoMTLightning
 from third_party.eomt.training.mask_classification_instance import (
@@ -88,11 +89,24 @@ class DA3EoMTTSLoRALightning(MaskClassificationInstance):
         self,
         lambda_3d: float = 0.0,
         lambda_2d: float = 1.0,
+        stage: str = "stage2_multiview_3d",
+        freeze_backbone: bool = False,
+        freeze_depth_ray_head: bool = False,
+        train_lora_only: bool = False,
+        log_lora_norms: bool = True,
         **kwargs: Any,
     ):
         self.lambda_3d = lambda_3d
         self.lambda_2d = lambda_2d
+        self.stage = stage
+        self.freeze_backbone = freeze_backbone
+        self.freeze_depth_ray_head = freeze_depth_ray_head
+        self.train_lora_only = train_lora_only
+        self.log_lora_norms = log_lora_norms
         super().__init__(**kwargs)
+
+        if self.stage.startswith("stage1"):
+            self._freeze_for_stage1()
 
     def forward(self, imgs, **kwargs):
         """Forward images through the wrapped network with optional extras."""
@@ -212,8 +226,72 @@ class DA3EoMTTSLoRALightning(MaskClassificationInstance):
                 self.log("loss_3d", loss_3d, on_step=True, prog_bar=True)
             self.log("loss_2d", loss_2d, on_step=True, prog_bar=True)
             self.log("loss_total", total, on_step=True, prog_bar=True)
+            if self.log_lora_norms:
+                self._log_lora_norms()
             return total
 
         base_loss = super().training_step((batch.images, batch.panoptic), batch_idx)
+        if self.log_lora_norms:
+            self._log_lora_norms()
+        if hasattr(self.network, "attn_mask_probs"):
+            self.log(
+                "attn_mask_prob_mean",
+                self.network.attn_mask_probs.mean(),
+                on_step=True,
+                prog_bar=False,
+            )
         return base_loss
+
+    def on_fit_start(self) -> None:
+        super().on_fit_start()
+        self._log_lora_config()
+
+    def _freeze_for_stage1(self) -> None:
+        """Freeze DA3 backbone and depth-related heads while keeping LoRA trainable."""
+
+        for _, param in self.network.named_parameters():
+            param.requires_grad = False
+
+        segmentation_modules = []
+        if hasattr(self.network, "encoder"):
+            segmentation_modules.append(getattr(self.network.encoder, "seg_head", None))
+            segmentation_modules.append(getattr(self.network.encoder, "seg_query_embed", None))
+        segmentation_modules.append(getattr(self.network, "class_predictor", None))
+
+        for module in segmentation_modules:
+            if module is None:
+                continue
+            for param in module.parameters():
+                param.requires_grad = True
+
+        for name, param in self.network.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+            elif any(keyword in name for keyword in ["seg_query", "seg_queries"]):
+                param.requires_grad = True
+
+    def _log_lora_norms(self) -> None:
+        lora_a_norms = []
+        lora_b_norms = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "lora_A" in name and param is not None:
+                lora_a_norms.append(param.detach().norm())
+            elif "lora_B" in name and param is not None:
+                lora_b_norms.append(param.detach().norm())
+
+        if lora_a_norms:
+            mean_a = torch.stack(lora_a_norms).mean()
+            self.log("lora_A_norm", mean_a, on_step=True, prog_bar=False)
+        if lora_b_norms:
+            mean_b = torch.stack(lora_b_norms).mean()
+            self.log("lora_B_norm", mean_b, on_step=True, prog_bar=False)
+
+    def _log_lora_config(self) -> None:
+        if not isinstance(self.logger, WandbLogger):
+            return
+        cfg = getattr(self.network, "tslora_cfg", None)
+        if cfg:
+            self.logger.experiment.config.update({"tslora": cfg}, allow_val_change=True)
 
