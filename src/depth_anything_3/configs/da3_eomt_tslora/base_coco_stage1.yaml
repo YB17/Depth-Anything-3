@@ -1,0 +1,67 @@
+# Stage-1: COCO panoptic single-view 2D segmentation with DA3+EoMT TS-LoRA
+# This file mirrors the EoMT COCO panoptic baseline while swapping in the
+# DA3-backed network and Stage-1 training defaults.
+
+model:
+  name: da3_eomt_tslora
+  builder: depth_anything_3.model.da3_eomt_tslora:build_da3_eomt_network_from_config
+  stage: stage1_coco_2d
+  backbone_type: da3_base
+  backbone_ckpt: null  # Optional: path/to/depth_anything_v3_base.ckpt
+  embed_dim: 768
+  num_seg_queries: 200
+  num_blocks: 3
+  masked_attn_enabled: true
+  # Token-selective LoRA
+  enable_tslora: true
+  tslora_rank: 64
+  tslora_alpha: 128
+  tslora_apply_to: ["q", "k", "v", "ffn1", "ffn2"]
+  # Stage-specific freezing
+  freeze_backbone: true
+  freeze_depth_ray_head: true
+  train_lora_only: true
+  # Loss scaling
+  lambda_2d: 1.0
+  lambda_3d: 0.0
+  # Attention mask annealing (copied from EoMT COCO panoptic 2x schedule)
+  attn_mask_annealing_enabled: true
+  attn_mask_annealing_start_steps: [29564, 73910, 118256]
+  attn_mask_annealing_end_steps: [59128, 103474, 147820]
+
+trainer:
+  max_epochs: 50
+  precision: "16-mixed"
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  accelerator: gpu
+  devices: 1
+  num_classes: 133
+  # Optimizer & schedule (mirrors EoMT with updated LR for LoRA + seg head)
+  lr: 0.0001
+  llrd: 1.0
+  llrd_l2_enabled: false
+  lr_mult: 1.0
+  weight_decay: 0.05
+  poly_power: 0.9
+  warmup_steps: [1500, 3000]
+
+logger:
+  project: da3_eomt_tslora
+  name: da3_eomt_tslora_coco_stage1
+  tags: ["stage1", "coco-panoptic", "tslora"]
+
+# Dataset + datamodule configuration copied from the EoMT COCO panoptic baseline.
+# The COCOPanoptic LightningDataModule expects COCO 2017 panoptic zips under
+# ``data.path``.
+data:
+  module: third_party.eomt.datasets.coco_panoptic.COCOPanoptic
+  path: /path/to/coco2017
+  batch_size: 4
+  num_workers: 8
+  img_size: [640, 640]
+  num_classes: 133
+  color_jitter_enabled: false
+  scale_range: [0.1, 2.0]
+  check_empty_targets: true
+  stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]
