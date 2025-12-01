@@ -234,28 +234,51 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
                     }
                 )
             # Add Feat_vis export parameters
-            if "feat_vis" in export_format:
-                if "feat_vis" not in export_kwargs:
-                    export_kwargs["feat_vis"] = {}
-                export_kwargs["feat_vis"].update(
-                    {
-                        "fps": feat_vis_fps,
-                    }
-                )
-            # Add COLMAP export parameters
-            if "colmap" in export_format:
-                if "colmap" not in export_kwargs:
-                    export_kwargs["colmap"] = {}
-                export_kwargs["colmap"].update(
-                    {
-                        "image_paths": image,
-                        "conf_thresh_percentile": conf_thresh_percentile,
-                        "process_res_method": process_res_method,
-                    }
-                )
-            self._export_results(prediction, export_format, export_dir, **export_kwargs)
+        if "feat_vis" in export_format:
+            if "feat_vis" not in export_kwargs:
+                export_kwargs["feat_vis"] = {}
+            export_kwargs["feat_vis"].update(
+                {
+                    "fps": feat_vis_fps,
+                }
+            )
+        # Add COLMAP export parameters
+        if "colmap" in export_format:
+            if "colmap" not in export_kwargs:
+                export_kwargs["colmap"] = {}
+            export_kwargs["colmap"].update(
+                {
+                    "image_paths": image,
+                    "conf_thresh_percentile": conf_thresh_percentile,
+                    "process_res_method": process_res_method,
+                }
+            )
+        self._export_results(prediction, export_format, export_dir, **export_kwargs)
 
         return prediction
+
+    @torch.inference_mode()
+    def inference_with_segmentation(
+        self,
+        image: list[np.ndarray | Image.Image | str],
+        extrinsics: np.ndarray | None = None,
+        intrinsics: np.ndarray | None = None,
+        process_res: int = 504,
+        process_res_method: str = "upper_bound_resize",
+    ) -> dict[str, torch.Tensor]:
+        """Run inference that also returns segmentation outputs when available."""
+
+        imgs_cpu, extrinsics, intrinsics = self._preprocess_inputs(
+            image, extrinsics, intrinsics, process_res, process_res_method
+        )
+        imgs, ex_t, in_t = self._prepare_model_inputs(imgs_cpu, extrinsics, intrinsics)
+        ex_t_norm = self._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
+
+        if hasattr(self.model, "inference_with_segmentation"):
+            return self.model.inference_with_segmentation(imgs, ex_t_norm, in_t)
+        if hasattr(self.model, "forward_with_segmentation"):
+            return self.model.forward_with_segmentation(imgs, ex_t_norm, in_t)
+        raise RuntimeError("Segmentation branch is unavailable for the loaded model.")
 
     def _preprocess_inputs(
         self,

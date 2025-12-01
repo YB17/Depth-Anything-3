@@ -1,0 +1,34 @@
+trainer:
+  img_size: [518, 518]
+  num_classes: 133
+  attn_mask_annealing_enabled: true
+  attn_mask_annealing_start_steps: [1000, 2000]
+  attn_mask_annealing_end_steps: [4000, 8000]
+  lr: 0.00005
+  llrd: 0.8
+  llrd_l2_enabled: true
+  lr_mult: 1.0
+  weight_decay: 0.05
+  poly_power: 0.9
+  warmup_steps: [250, 500]
+
+model:
+  builder: depth_anything_3.model.da3_eomt_tslora:build_da3_eomt_network_from_config
+  num_seg_queries: 128
+  l_split: 12
+  enable_tslora: true
+  tslora_rank: 4
+  tslora_alpha: 16
+  tslora_apply_to: ["q", "k", "v", "ffn_in", "ffn_out"]
+  lambda_2d: 1.0
+  lambda_3d: 0.5
+  embed_dim: 768
+  encoder_fn: null
+
+data:
+  stage: "3d"
+  dataset: "scannet"
+  batch_size: 2
+  num_workers: 8
+  views_per_sample: 3
+  image_shape: [518, 518]

@@ -8,7 +8,7 @@
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
 import math
-from typing import Callable, List, Sequence, Tuple, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
@@ -103,6 +103,10 @@ class DinoVisionTransformer(nn.Module):
         rope_freq=100,
         plus_cam_token=False,
         cat_token=True,
+        enable_tslora: bool = False,
+        tslora_rank: int = 4,
+        tslora_alpha: float = 1.0,
+        tslora_apply_to: tuple | list = ("q", "k", "v", "ffn_in", "ffn_out"),
     ):
         """
         Args:
@@ -147,6 +151,12 @@ class DinoVisionTransformer(nn.Module):
         self.num_register_tokens = num_register_tokens
         self.interpolate_antialias = interpolate_antialias
         self.interpolate_offset = interpolate_offset
+        tslora_cfg = {
+            "enable": enable_tslora,
+            "rank": tslora_rank,
+            "alpha": tslora_alpha,
+            "apply_to": tslora_apply_to,
+        }
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
@@ -205,6 +215,7 @@ class DinoVisionTransformer(nn.Module):
                 init_values=init_values,
                 qk_norm=i >= qknorm_start if qknorm_start != -1 else False,
                 rope=self.rope if i >= rope_start and rope_start != -1 else None,
+                tslora_cfg=tslora_cfg,
             )
             for i in range(depth)
         ]
@@ -291,7 +302,9 @@ class DinoVisionTransformer(nn.Module):
                 pos_nodiff = torch.cat([pos_special, pos_nodiff], dim=2)
         return pos, pos_nodiff
 
-    def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
+    def _get_intermediate_layers_not_chunked(
+        self, x, n=1, export_feat_layers=[], token_mask_for_lora=None, **kwargs
+    ):
         B, S, _, H, W = x.shape
         x = self.prepare_tokens_with_masks(x)
         output, total_block_len, aux_output = [], len(self.blocks), []
@@ -316,10 +329,21 @@ class DinoVisionTransformer(nn.Module):
 
             if self.alt_start != -1 and i >= self.alt_start and i % 2 == 1:
                 x = self.process_attention(
-                    x, blk, "global", pos=g_pos, attn_mask=kwargs.get("attn_mask", None)
+                    x,
+                    blk,
+                    "global",
+                    pos=g_pos,
+                    attn_mask=kwargs.get("attn_mask", None),
+                    token_mask=token_mask_for_lora,
                 )
             else:
-                x = self.process_attention(x, blk, "local", pos=l_pos)
+                x = self.process_attention(
+                    x,
+                    blk,
+                    "local",
+                    pos=l_pos,
+                    token_mask=token_mask_for_lora,
+                )
                 local_x = x
 
             if i in blocks_to_take:
@@ -329,20 +353,26 @@ class DinoVisionTransformer(nn.Module):
                 aux_output.append(x)
         return output, aux_output
 
-    def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None):
+    def process_attention(
+        self, x, block, attn_type="global", pos=None, attn_mask=None, token_mask=None
+    ):
         b, s, n = x.shape[:3]
         if attn_type == "local":
             x = rearrange(x, "b s n c -> (b s) n c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> (b s) n c")
+            if token_mask is not None:
+                token_mask = rearrange(token_mask, "b s n -> (b s) n")
         elif attn_type == "global":
             x = rearrange(x, "b s n c -> b (s n) c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> b (s n) c")
+            if token_mask is not None:
+                token_mask = rearrange(token_mask, "b s n -> b (s n)")
         else:
             raise ValueError(f"Invalid attention type: {attn_type}")
 
-        x = block(x, pos=pos, attn_mask=attn_mask)
+        x = block(x, pos=pos, attn_mask=attn_mask, token_mask=token_mask)
 
         if attn_type == "local":
             x = rearrange(x, "(b s) n c -> b s n c", b=b, s=s)
@@ -355,10 +385,15 @@ class DinoVisionTransformer(nn.Module):
         x: torch.Tensor,
         n: Union[int, Sequence] = 1,  # Layers or n last layers to take
         export_feat_layers: List[int] = [],
+        token_mask_for_lora=None,
         **kwargs,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
         outputs, aux_outputs = self._get_intermediate_layers_not_chunked(
-            x, n, export_feat_layers=export_feat_layers, **kwargs
+            x,
+            n,
+            export_feat_layers=export_feat_layers,
+            token_mask_for_lora=token_mask_for_lora,
+            **kwargs,
         )
         camera_tokens = [out[0] for out in outputs]
         if outputs[0][1].shape[-1] == self.embed_dim:

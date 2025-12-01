@@ -18,6 +18,7 @@ from .attention import Attention
 from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
+from depth_anything_3.model.lora.token_selective_lora import wrap_linear_with_tslora
 
 logger = logging.getLogger("dinov2")
 XFORMERS_AVAILABLE = True
@@ -43,6 +44,7 @@ class Block(nn.Module):
         qk_norm: bool = False,
         rope=None,
         ln_eps: float = 1e-6,
+        tslora_cfg: dict | None = None,
     ) -> None:
         super().__init__()
         # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
@@ -56,6 +58,7 @@ class Block(nn.Module):
             proj_drop=drop,
             qk_norm=qk_norm,
             rope=rope,
+            tslora_cfg=tslora_cfg,
         )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -74,12 +77,32 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+        if tslora_cfg and tslora_cfg.get("enable", False):
+            apply_to = {s.lower() for s in tslora_cfg.get("apply_to", [])}
+            # Accept multiple aliases for FFN layers to align with the spec.
+            ffn_in_aliases = {"ffn_in", "ffn1", "fc1"}
+            ffn_out_aliases = {"ffn_out", "ffn2", "fc2"}
+            rank = tslora_cfg.get("rank", 4)
+            alpha = tslora_cfg.get("alpha", 1.0)
+            if apply_to & ffn_in_aliases:
+                self.mlp.fc1 = wrap_linear_with_tslora(
+                    self.mlp.fc1, rank=rank, alpha=alpha, enable=True
+                )
+            if apply_to & ffn_out_aliases:
+                self.mlp.fc2 = wrap_linear_with_tslora(
+                    self.mlp.fc2, rank=rank, alpha=alpha, enable=True
+                )
+
+    def forward(self, x: Tensor, pos=None, attn_mask=None, token_mask=None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None, attn_mask=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
+            return self.ls1(
+                self.attn(
+                    self.norm1(x), pos=pos, attn_mask=attn_mask, token_mask=token_mask
+                )
+            )
 
         def ffn_residual_func(x: Tensor) -> Tensor:
-            return self.ls2(self.mlp(self.norm2(x)))
+            return self.ls2(self.mlp(self.norm2(x), token_mask=token_mask))
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1

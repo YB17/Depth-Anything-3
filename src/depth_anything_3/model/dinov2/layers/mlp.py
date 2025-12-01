@@ -31,10 +31,16 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
+    def forward(self, x: Tensor, token_mask: Optional[Tensor] = None) -> Tensor:
+        if hasattr(self.fc1, "forward") and "token_mask" in self.fc1.forward.__code__.co_varnames:
+            x = self.fc1(x, token_mask=token_mask)
+        else:
+            x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        if hasattr(self.fc2, "forward") and "token_mask" in self.fc2.forward.__code__.co_varnames:
+            x = self.fc2(x, token_mask=token_mask)
+        else:
+            x = self.fc2(x)
         x = self.drop(x)
         return x
