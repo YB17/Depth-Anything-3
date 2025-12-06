@@ -1,0 +1,35 @@
+trainer:
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: da3_seg_coco
+      name: stage1_da3b_coco640
+  devices: 8
+  accelerator: gpu
+  strategy: ddp
+  precision: 16-mixed
+
+model:
+  class_path: depth_anything_3.training.seg_panoptic_module.DA3SegPanopticModule
+  init_args:
+    img_size: [640, 640]
+    num_classes: 133
+    stuff_classes: []
+    attn_mask_annealing_enabled: true
+    num_masked_layers: 4
+    lr: 0.0002
+    llrd: 0.8
+    weight_decay: 0.05
+    warmup_steps: [500, 1000]
+    poly_power: 0.9
+
+data:
+  class_path: depth_anything_3.training.coco_panoptic_datamodule.COCOPanopticDataModule
+  init_args:
+    root: /path/to/coco
+    panoptic_json_train: /path/to/panoptic_train2017.json
+    panoptic_json_val: /path/to/panoptic_val2017.json
+    stuff_classes: []
+    batch_size_per_gpu: 4
+    num_workers: 8
+    img_size: [640, 640]

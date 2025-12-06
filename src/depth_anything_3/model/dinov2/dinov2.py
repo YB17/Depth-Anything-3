@@ -28,6 +28,7 @@ class DinoV2(nn.Module):
         qknorm_start: int = -1,
         rope_start: int = -1,
         cat_token: bool = True,
+        seg_cfg: dict | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -54,6 +55,7 @@ class DinoV2(nn.Module):
             qknorm_start=qknorm_start,
             rope_start=rope_start,
             cat_token=cat_token,
+            seg_cfg=seg_cfg,
             **kwargs,
         )
 

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 from addict import Dict
@@ -103,6 +105,10 @@ class DepthAnything3Net(nn.Module):
         intrinsics: torch.Tensor | None = None,
         export_feat_layers: list[int] | None = [],
         infer_gs: bool = False,
+        seg_mask_probs: list[float] | None = None,
+        seg_head_fn: Callable[[torch.Tensor, torch.Tensor], dict] | None = None,
+        apply_seg_head_to_intermediate: bool = True,
+        apply_seg_head_to_last: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the network.
@@ -123,9 +129,20 @@ class DepthAnything3Net(nn.Module):
         else:
             cam_token = None
 
-        feats, aux_feats = self.backbone(
-            x, cam_token=cam_token, export_feat_layers=export_feat_layers
+        backbone_out = self.backbone(
+            x,
+            cam_token=cam_token,
+            export_feat_layers=export_feat_layers,
+            seg_mask_probs=seg_mask_probs,
+            seg_head_fn=seg_head_fn,
+            apply_seg_head_to_intermediate=apply_seg_head_to_intermediate,
+            apply_seg_head_to_last=apply_seg_head_to_last,
         )
+        if isinstance(backbone_out, tuple) and len(backbone_out) == 3:
+            feats, aux_feats, seg_tokens = backbone_out
+        else:
+            feats, aux_feats = backbone_out
+            seg_tokens = None
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
 
@@ -135,6 +152,9 @@ class DepthAnything3Net(nn.Module):
             output = self._process_camera_estimation(feats, H, W, output)
             if infer_gs:
                 output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
+
+        if seg_tokens is not None:
+            output.seg_tokens = seg_tokens
 
         # Extract auxiliary features if requested
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
