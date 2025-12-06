@@ -16,6 +16,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 
 from depth_anything_3.utils.logger import logger
+from depth_anything_3.model.segmentation import SegmentationLayer, SegmentationTokens
 
 from .layers import LayerScale  # noqa: F401
 from .layers import Mlp  # noqa: F401
@@ -107,6 +108,7 @@ class DinoVisionTransformer(nn.Module):
         tslora_rank: int = 4,
         tslora_alpha: float = 1.0,
         tslora_apply_to: tuple | list = ("q", "k", "v", "ffn_in", "ffn_out"),
+        seg_cfg: Optional[dict] | None = None,
     ):
         """
         Args:
@@ -222,6 +224,41 @@ class DinoVisionTransformer(nn.Module):
         self.blocks = nn.ModuleList(blocks_list)
         self.norm = norm_layer(embed_dim)
 
+        # Segmentation branch configuration (disabled by default to preserve
+        # existing behaviour).
+        seg_cfg = seg_cfg or {}
+        self.enable_seg = seg_cfg.get("enable", False)
+        self.seg_layer_start = seg_cfg.get("layer_start", depth)
+        self.num_bottleneck_tokens = seg_cfg.get("num_bottleneck_tokens", 0)
+        self.num_seg_queries = seg_cfg.get("num_queries", 0)
+        self.seg_dropout = seg_cfg.get("dropout", 0.0)
+        self.seg_attn_dropout = seg_cfg.get("attn_dropout", 0.0)
+        self.num_seg_masked_layers = seg_cfg.get("num_masked_layers", 0)
+        if self.enable_seg:
+            self.seg_tokens = SegmentationTokens(
+                embed_dim=embed_dim,
+                num_bottleneck_tokens=self.num_bottleneck_tokens,
+                num_queries=self.num_seg_queries,
+            )
+            self.seg_blocks = nn.ModuleList()
+            for i in range(depth):
+                if i < self.seg_layer_start:
+                    self.seg_blocks.append(nn.Identity())
+                else:
+                    self.seg_blocks.append(
+                        SegmentationLayer(
+                            embed_dim=embed_dim,
+                            num_heads=num_heads,
+                            mlp_ratio=mlp_ratio,
+                            attn_dropout=self.seg_attn_dropout,
+                            dropout=self.seg_dropout,
+                            patch_grid=self.patch_embed.grid_size,
+                        )
+                    )
+        else:
+            self.seg_tokens = None
+            self.seg_blocks = None
+
     def interpolate_pos_encoding(self, x, w, h):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
@@ -303,13 +340,34 @@ class DinoVisionTransformer(nn.Module):
         return pos, pos_nodiff
 
     def _get_intermediate_layers_not_chunked(
-        self, x, n=1, export_feat_layers=[], token_mask_for_lora=None, **kwargs
+        self,
+        x,
+        n=1,
+        export_feat_layers=[],
+        token_mask_for_lora=None,
+        seg_mask_probs: list[float] | None = None,
+        seg_head_fn: Callable[[torch.Tensor, torch.Tensor], dict] | None = None,
+        apply_seg_head_to_intermediate: bool = True,
+        apply_seg_head_to_last: bool = True,
+        **kwargs,
     ):
         B, S, _, H, W = x.shape
         x = self.prepare_tokens_with_masks(x)
         output, total_block_len, aux_output = [], len(self.blocks), []
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
+        local_x = x
+
+        seg_output = None
+        seg_layer_outputs = []
+        if self.enable_seg:
+            seg_geom = rearrange(x, "b s n c -> (b s) n c")
+            B_tokens, G_seg, S_tokens = self.seg_tokens(seg_geom)
+            seg_output = {"B": B_tokens, "G_seg": G_seg, "S": S_tokens}
+            prev_mask_logits = None
+            num_seg_layers = len(self.seg_blocks) - self.seg_layer_start
+        else:
+            B_tokens = G_seg = S_tokens = None
 
         for i, blk in enumerate(self.blocks):
             if i < self.rope_start or self.rope is None:
@@ -346,12 +404,63 @@ class DinoVisionTransformer(nn.Module):
                 )
                 local_x = x
 
+            if self.enable_seg and i >= self.seg_layer_start:
+                seg_idx = i - self.seg_layer_start
+                mask_prob = None
+                if self.training and seg_mask_probs is not None and len(seg_mask_probs) > seg_idx:
+                    mask_prob = seg_mask_probs[seg_idx]
+
+                geom_for_seg = rearrange(local_x, "b s n c -> (b s) n c")
+                B_tokens, G_seg, S_tokens = self.seg_blocks[i](
+                    geom_for_seg,
+                    B_tokens,
+                    G_seg,
+                    S_tokens,
+                    prev_mask_logits=prev_mask_logits if seg_idx > 0 else None,
+                    mask_prob=mask_prob if seg_idx > 0 else None,
+                    patch_grid=self.patch_embed.grid_size,
+                )
+
+                head_outputs = None
+                should_run_head = False
+                if seg_head_fn is not None:
+                    is_last_seg_layer = seg_idx == num_seg_layers - 1
+                    if self.training:
+                        should_run_head = True
+                    else:
+                        should_run_head = apply_seg_head_to_last and is_last_seg_layer
+                        should_run_head = should_run_head or (
+                            apply_seg_head_to_intermediate and not is_last_seg_layer
+                        )
+
+                if should_run_head and seg_head_fn is not None:
+                    head_outputs = seg_head_fn(G_seg, S_tokens)
+
+                if self.training and head_outputs is not None:
+                    prev_mask_logits = head_outputs.get("pred_masks")
+                else:
+                    prev_mask_logits = None
+
+                if self.training or should_run_head:
+                    seg_layer_outputs.append(
+                        {"G_seg": G_seg, "S": S_tokens, "head_outputs": head_outputs}
+                    )
+
             if i in blocks_to_take:
                 out_x = torch.cat([local_x, x], dim=-1) if self.cat_token else x
                 output.append((out_x[:, :, 0], out_x))
             if i in export_feat_layers:
                 aux_output.append(x)
-        return output, aux_output
+        if self.enable_seg:
+            seg_output = {
+                "B": B_tokens,
+                "G_seg": G_seg,
+                "S": S_tokens,
+                "patch_grid": self.patch_embed.grid_size,
+                "layers": seg_layer_outputs,
+            }
+
+        return output, aux_output, seg_output
 
     def process_attention(
         self, x, block, attn_type="global", pos=None, attn_mask=None, token_mask=None
@@ -386,13 +495,19 @@ class DinoVisionTransformer(nn.Module):
         n: Union[int, Sequence] = 1,  # Layers or n last layers to take
         export_feat_layers: List[int] = [],
         token_mask_for_lora=None,
+        seg_head_fn: Callable[[torch.Tensor, torch.Tensor], dict] | None = None,
+        apply_seg_head_to_intermediate: bool = True,
+        apply_seg_head_to_last: bool = True,
         **kwargs,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
-        outputs, aux_outputs = self._get_intermediate_layers_not_chunked(
+        outputs, aux_outputs, seg_output = self._get_intermediate_layers_not_chunked(
             x,
             n,
             export_feat_layers=export_feat_layers,
             token_mask_for_lora=token_mask_for_lora,
+            seg_head_fn=seg_head_fn,
+            apply_seg_head_to_intermediate=apply_seg_head_to_intermediate,
+            apply_seg_head_to_last=apply_seg_head_to_last,
             **kwargs,
         )
         camera_tokens = [out[0] for out in outputs]
@@ -411,7 +526,7 @@ class DinoVisionTransformer(nn.Module):
         aux_outputs = [self.norm(out) for out in aux_outputs]
         outputs = [out[..., 1 + self.num_register_tokens :, :] for out in outputs]
         aux_outputs = [out[..., 1 + self.num_register_tokens :, :] for out in aux_outputs]
-        return tuple(zip(outputs, camera_tokens)), aux_outputs
+        return tuple(zip(outputs, camera_tokens)), aux_outputs, seg_output
 
 
 def vit_small(patch_size=16, num_register_tokens=0, depth=12, **kwargs):

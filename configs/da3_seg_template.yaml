@@ -1,0 +1,26 @@
+model:
+  net:
+    target: depth_anything_3.model.dinov2.dinov2.DinoV2
+    params:
+      name: vitb
+      out_layers: [8, 11]
+      alt_start: -1
+      qknorm_start: -1
+      rope_start: -1
+      cat_token: true
+      seg_cfg:
+        enable: true
+        num_bottleneck_tokens: 16
+        num_queries: 100
+        layer_start: 6
+        dropout: 0.0
+        attn_dropout: 0.0
+  head:
+    target: depth_anything_3.model.head.dpt.DPTHead
+    params:
+      in_channels: [768, 768]
+      embedding_dim: 256
+      features: 256
+      out_channels: 1
+      patch_size: 14
+      readout_type: ignore
