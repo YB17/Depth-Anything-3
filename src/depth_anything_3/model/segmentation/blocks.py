@@ -80,13 +80,7 @@ class GSegFromBBlock(nn.Module):
 
 
 class SemanticBlock(nn.Module):
-    """Decoder-style block where queries attend to segmentation geometry.
-
-    Masked attention is driven by mask logits produced outside the block (from
-    the previous semantic layer). The block only *consumes* ``prev_mask_logits``
-    and uses a layer-level annealing probability to decide whether to apply the
-    mask for the current step.
-    """
+    """Decoder-style block where queries attend to segmentation geometry."""
 
     def __init__(
         self,
@@ -108,49 +102,16 @@ class SemanticBlock(nn.Module):
         self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.patch_grid = patch_grid
-
-    def _build_attn_mask(
-        self,
-        prev_mask_logits: Tensor,
-        mask_prob: float,
-        num_heads: int,
-        training: bool,
-    ) -> Optional[Tensor]:
-        """Construct an attention mask using previous-layer mask logits.
-
-        A single Bernoulli draw per block decides whether to enable masking for
-        the current step. If masking is disabled or the model is not in training
-        mode, ``None`` is returned to fall back to plain cross-attention.
-        """
-
-        if mask_prob is None or mask_prob <= 0 or not training:
-            return None
-
-        apply_mask = torch.rand((), device=prev_mask_logits.device) < mask_prob
-        if not bool(apply_mask):
-            return None
-
-        allowed = prev_mask_logits.reshape(prev_mask_logits.shape[0], prev_mask_logits.shape[1], -1) > 0
-        attn_mask = (~allowed).repeat_interleave(num_heads, dim=0)
-        return attn_mask
+        self.num_heads = num_heads
 
     def forward(
         self,
         queries: Tensor,
         seg_tokens: Tensor,
-        prev_mask_logits: Optional[Tensor] = None,
-        mask_prob: float | None = None,
+        attn_mask: Optional[Tensor] = None,
         patch_grid: Tuple[int, int] | None = None,
     ) -> Tensor:
         _ = patch_grid or self.patch_grid
-        attn_mask = None
-        if prev_mask_logits is not None and mask_prob is not None:
-            attn_mask = self._build_attn_mask(
-                prev_mask_logits=prev_mask_logits,
-                mask_prob=mask_prob,
-                num_heads=self.mha.num_heads,
-                training=self.training,
-            )
 
         attn_out, _ = self.mha(
             query=queries, key=seg_tokens, value=seg_tokens, attn_mask=attn_mask, need_weights=False
@@ -185,8 +146,7 @@ class SegmentationLayer(nn.Module):
         bottleneck_tokens: Tensor,
         seg_tokens: Tensor,
         queries: Tensor,
-        prev_mask_logits: Optional[Tensor] = None,
-        mask_prob: float | None = None,
+        attn_mask: Optional[Tensor] = None,
         patch_grid: Tuple[int, int] | None = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         bottleneck_tokens = self.b_block(geom_tokens, bottleneck_tokens)
@@ -194,8 +154,7 @@ class SegmentationLayer(nn.Module):
         queries = self.s_block(
             queries,
             seg_tokens,
-            prev_mask_logits=prev_mask_logits,
-            mask_prob=mask_prob,
+            attn_mask=attn_mask,
             patch_grid=patch_grid,
         )
         return bottleneck_tokens, seg_tokens, queries

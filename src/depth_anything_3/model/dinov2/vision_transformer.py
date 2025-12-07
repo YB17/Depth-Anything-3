@@ -345,7 +345,7 @@ class DinoVisionTransformer(nn.Module):
         n=1,
         export_feat_layers=[],
         token_mask_for_lora=None,
-        seg_mask_probs: list[float] | None = None,
+        seg_attn_mask_fn: Callable[[torch.Tensor, int, int], torch.Tensor | None] | None = None,
         seg_head_fn: Callable[[torch.Tensor, torch.Tensor], dict] | None = None,
         apply_seg_head_to_intermediate: bool = True,
         apply_seg_head_to_last: bool = True,
@@ -406,18 +406,21 @@ class DinoVisionTransformer(nn.Module):
 
             if self.enable_seg and i >= self.seg_layer_start:
                 seg_idx = i - self.seg_layer_start
-                mask_prob = None
-                if self.training and seg_mask_probs is not None and len(seg_mask_probs) > seg_idx:
-                    mask_prob = seg_mask_probs[seg_idx]
-
                 geom_for_seg = rearrange(local_x, "b s n c -> (b s) n c")
+                attn_mask = None
+                if (
+                    self.training
+                    and seg_attn_mask_fn is not None
+                    and prev_mask_logits is not None
+                    and seg_idx > 0
+                ):
+                    attn_mask = seg_attn_mask_fn(prev_mask_logits, seg_idx, self.seg_blocks[i].s_block.num_heads)
                 B_tokens, G_seg, S_tokens = self.seg_blocks[i](
                     geom_for_seg,
                     B_tokens,
                     G_seg,
                     S_tokens,
-                    prev_mask_logits=prev_mask_logits if seg_idx > 0 else None,
-                    mask_prob=mask_prob if seg_idx > 0 else None,
+                    attn_mask=attn_mask,
                     patch_grid=self.patch_embed.grid_size,
                 )
 
@@ -495,6 +498,7 @@ class DinoVisionTransformer(nn.Module):
         n: Union[int, Sequence] = 1,  # Layers or n last layers to take
         export_feat_layers: List[int] = [],
         token_mask_for_lora=None,
+        seg_attn_mask_fn: Callable[[torch.Tensor, int, int], torch.Tensor | None] | None = None,
         seg_head_fn: Callable[[torch.Tensor, torch.Tensor], dict] | None = None,
         apply_seg_head_to_intermediate: bool = True,
         apply_seg_head_to_last: bool = True,
@@ -505,6 +509,7 @@ class DinoVisionTransformer(nn.Module):
             n,
             export_feat_layers=export_feat_layers,
             token_mask_for_lora=token_mask_for_lora,
+            seg_attn_mask_fn=seg_attn_mask_fn,
             seg_head_fn=seg_head_fn,
             apply_seg_head_to_intermediate=apply_seg_head_to_intermediate,
             apply_seg_head_to_last=apply_seg_head_to_last,
