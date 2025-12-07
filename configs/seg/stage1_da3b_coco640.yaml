@@ -20,6 +20,16 @@ model:
   weight_decay: 0.05
   warmup_steps: [500, 1000]
   poly_power: 0.9
+  network:
+    class_path: depth_anything_3.model.da3_eomt_tslora.build_da3_eomt_network_from_config
+    init_args:
+      cfg:
+        # Basic scaffold settings; override via CLI flags if running a custom encoder.
+        embed_dim: 768
+        num_seg_queries: 128
+        num_blocks: 4
+        masked_attn_enabled: true
+        num_classes: ${model.num_classes}
 
 data:
   root: /home/jovyan/ybai_ws/dataset/dataset/coco
