@@ -12,9 +12,9 @@ from depth_anything_3.training.seg_panoptic_module import DA3SegPanopticModule
 
 class SegLightningCLI(cli.LightningCLI):
     def add_arguments_to_parser(self, parser: cli.LightningArgumentParser) -> None:
-        parser.link_arguments("data.init_args.img_size", "model.init_args.img_size")
-        parser.link_arguments("data.init_args.num_classes", "model.init_args.num_classes", apply_on="instantiate")
-        parser.link_arguments("data.init_args.stuff_classes", "model.init_args.stuff_classes", apply_on="instantiate")
+        parser.link_arguments("data.img_size", "model.img_size")
+        parser.link_arguments("data.num_classes", "model.num_classes", apply_on="instantiate")
+        parser.link_arguments("data.stuff_classes", "model.stuff_classes", apply_on="instantiate")
 
     def fit(self, model: pl.LightningModule, datamodule: pl.LightningDataModule, **kwargs):
         logger = kwargs.get("trainer", {}).get("logger", None)
@@ -28,7 +28,7 @@ def cli_main():
     SegLightningCLI(
         DA3SegPanopticModule,
         COCOPanopticDataModule,
-        save_config_overwrite=True,
+        # save_config_overwrite=True,
         trainer_defaults={
             "accelerator": "gpu",
             "devices": 8,

@@ -5,11 +5,14 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from depth_anything_3.model.dinov2.vision_transformer import (
-    DropPath,
-    LayerScale,
-    drop_add_residual_stochastic_depth,
-)
+# from depth_anything_3.model.dinov2.vision_transformer import (
+#     DropPath,
+#     LayerScale,
+#     drop_add_residual_stochastic_depth,
+# )
+from depth_anything_3.model.dinov2.layers.drop_path import DropPath
+from depth_anything_3.model.dinov2.layers.layer_scale import LayerScale
+from depth_anything_3.model.dinov2.layers.block import drop_add_residual_stochastic_depth
 
 class _FFN(nn.Module):
     def __init__(self, embed_dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):

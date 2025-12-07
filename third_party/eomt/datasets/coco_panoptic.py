@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Union
 from torch.utils.data import DataLoader
 
-from datasets.lightning_data_module import LightningDataModule
-from datasets.transforms import Transforms
-from datasets.dataset import Dataset
+from .lightning_data_module import LightningDataModule
+from .transforms import Transforms
+from .dataset import Dataset
 
 CLASS_MAPPING = {
     1: 0,
