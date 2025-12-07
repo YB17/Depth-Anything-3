@@ -17,6 +17,9 @@ from einops import rearrange
 
 from depth_anything_3.utils.logger import logger
 from depth_anything_3.model.segmentation import SegmentationLayer, SegmentationTokens
+from depth_anything_3.model.dinov2.layers.block import drop_add_residual_stochastic_depth
+from depth_anything_3.model.dinov2.layers.drop_path import DropPath
+from depth_anything_3.model.dinov2.layers.layer_scale import LayerScale
 
 from .layers import LayerScale  # noqa: F401
 from .layers import Mlp  # noqa: F401

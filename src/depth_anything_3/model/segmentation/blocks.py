@@ -5,6 +5,12 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 
+from depth_anything_3.model.dinov2.vision_transformer import (
+    DropPath,
+    LayerScale,
+    drop_add_residual_stochastic_depth,
+)
+
 class _FFN(nn.Module):
     def __init__(self, embed_dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
@@ -30,24 +36,81 @@ class BottleneckBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         attn_dropout: float = 0.0,
-        dropout: float = 0.0,
+        drop: float = 0.0,
+        ln_eps: float = 1e-6,
+        init_values: float | None = None,
+        drop_path: float = 0.0,
+        patch_grid: Tuple[int, int] | None = None,
     ):
         super().__init__()
+        self.patch_grid = patch_grid
         self.mha = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             dropout=attn_dropout,
             batch_first=True,
         )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(embed_dim, eps=ln_eps)
+        self.ls1 = LayerScale(embed_dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, geom_tokens: Tensor, bottleneck_tokens: Tensor) -> Tensor:
-        attn_out, _ = self.mha(query=bottleneck_tokens, key=geom_tokens, value=geom_tokens, need_weights=False)
-        mid = bottleneck_tokens + self.dropout(attn_out)
-        ffn_out = self.ffn(self.norm(mid))
-        return mid + self.dropout(ffn_out)
+        self.norm2 = nn.LayerNorm(embed_dim, eps=ln_eps)
+        self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=drop)
+        self.ls2 = LayerScale(embed_dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.sample_drop_ratio = drop_path
+
+    def forward(
+        self,
+        geom_tokens: Tensor,
+        bottleneck_tokens: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        patch_grid: Tuple[int, int] | None = None,
+    ) -> Tensor:
+        _ = patch_grid or self.patch_grid
+
+        def attn_residual_func(
+            b_tokens: Tensor, geom_tokens: Tensor, attn_mask: Optional[Tensor] = None
+        ) -> Tensor:
+            attn_out, _ = self.mha(
+                query=self.norm1(b_tokens),
+                key=geom_tokens,
+                value=geom_tokens,
+                attn_mask=attn_mask,
+                need_weights=False,
+            )
+            return self.ls1(attn_out)
+
+        def ffn_residual_func(b_tokens: Tensor) -> Tensor:
+            return self.ls2(self.ffn(self.norm2(b_tokens)))
+
+        if self.training and self.sample_drop_ratio > 0.1:
+            bottleneck_tokens = drop_add_residual_stochastic_depth(
+                bottleneck_tokens,
+                residual_func=lambda x_subset: attn_residual_func(
+                    x_subset, geom_tokens, attn_mask=attn_mask
+                ),
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+            bottleneck_tokens = drop_add_residual_stochastic_depth(
+                bottleneck_tokens,
+                residual_func=ffn_residual_func,
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+        elif self.training and self.sample_drop_ratio > 0.0:
+            bottleneck_tokens = bottleneck_tokens + self.drop_path1(
+                attn_residual_func(bottleneck_tokens, geom_tokens, attn_mask=attn_mask)
+            )
+            bottleneck_tokens = bottleneck_tokens + self.drop_path2(
+                ffn_residual_func(bottleneck_tokens)
+            )
+        else:
+            bottleneck_tokens = bottleneck_tokens + attn_residual_func(
+                bottleneck_tokens, geom_tokens, attn_mask=attn_mask
+            )
+            bottleneck_tokens = bottleneck_tokens + ffn_residual_func(bottleneck_tokens)
+        return bottleneck_tokens
 
 
 class GSegFromBBlock(nn.Module):
@@ -59,24 +122,79 @@ class GSegFromBBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         attn_dropout: float = 0.0,
-        dropout: float = 0.0,
+        drop: float = 0.0,
+        ln_eps: float = 1e-6,
+        init_values: float | None = None,
+        drop_path: float = 0.0,
+        patch_grid: Tuple[int, int] | None = None,
     ):
         super().__init__()
+        self.patch_grid = patch_grid
         self.mha = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             dropout=attn_dropout,
             batch_first=True,
         )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(embed_dim, eps=ln_eps)
+        self.ls1 = LayerScale(embed_dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, seg_tokens: Tensor, bottleneck_tokens: Tensor) -> Tensor:
-        attn_out, _ = self.mha(query=seg_tokens, key=bottleneck_tokens, value=bottleneck_tokens, need_weights=False)
-        mid = seg_tokens + self.dropout(attn_out)
-        ffn_out = self.ffn(self.norm(mid))
-        return mid + self.dropout(ffn_out)
+        self.norm2 = nn.LayerNorm(embed_dim, eps=ln_eps)
+        self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=drop)
+        self.ls2 = LayerScale(embed_dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.sample_drop_ratio = drop_path
+
+    def forward(
+        self,
+        seg_tokens: Tensor,
+        bottleneck_tokens: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        patch_grid: Tuple[int, int] | None = None,
+    ) -> Tensor:
+        _ = patch_grid or self.patch_grid
+
+        def attn_residual_func(
+            g_tokens: Tensor, b_tokens: Tensor, attn_mask: Optional[Tensor] = None
+        ) -> Tensor:
+            attn_out, _ = self.mha(
+                query=self.norm1(g_tokens),
+                key=b_tokens,
+                value=b_tokens,
+                attn_mask=attn_mask,
+                need_weights=False,
+            )
+            return self.ls1(attn_out)
+
+        def ffn_residual_func(g_tokens: Tensor) -> Tensor:
+            return self.ls2(self.ffn(self.norm2(g_tokens)))
+
+        if self.training and self.sample_drop_ratio > 0.1:
+            seg_tokens = drop_add_residual_stochastic_depth(
+                seg_tokens,
+                residual_func=lambda x_subset: attn_residual_func(
+                    x_subset, bottleneck_tokens, attn_mask=attn_mask
+                ),
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+            seg_tokens = drop_add_residual_stochastic_depth(
+                seg_tokens,
+                residual_func=ffn_residual_func,
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+        elif self.training and self.sample_drop_ratio > 0.0:
+            seg_tokens = seg_tokens + self.drop_path1(
+                attn_residual_func(seg_tokens, bottleneck_tokens, attn_mask=attn_mask)
+            )
+            seg_tokens = seg_tokens + self.drop_path2(ffn_residual_func(seg_tokens))
+        else:
+            seg_tokens = seg_tokens + attn_residual_func(
+                seg_tokens, bottleneck_tokens, attn_mask=attn_mask
+            )
+            seg_tokens = seg_tokens + ffn_residual_func(seg_tokens)
+        return seg_tokens
 
 
 class SemanticBlock(nn.Module):
@@ -88,8 +206,11 @@ class SemanticBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         attn_dropout: float = 0.0,
-        dropout: float = 0.0,
+        drop: float = 0.0,
         patch_grid: Tuple[int, int] | None = None,
+        ln_eps: float = 1e-6,
+        init_values: float | None = None,
+        drop_path: float = 0.0,
     ):
         super().__init__()
         self.mha = nn.MultiheadAttention(
@@ -98,11 +219,18 @@ class SemanticBlock(nn.Module):
             dropout=attn_dropout,
             batch_first=True,
         )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(embed_dim, eps=ln_eps)
+        self.ls1 = LayerScale(embed_dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = nn.LayerNorm(embed_dim, eps=ln_eps)
+        self.ffn = _FFN(embed_dim, mlp_ratio=mlp_ratio, dropout=drop)
+        self.ls2 = LayerScale(embed_dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.patch_grid = patch_grid
         self.num_heads = num_heads
+
+        self.sample_drop_ratio = drop_path
 
     def forward(
         self,
@@ -113,12 +241,43 @@ class SemanticBlock(nn.Module):
     ) -> Tensor:
         _ = patch_grid or self.patch_grid
 
-        attn_out, _ = self.mha(
-            query=queries, key=seg_tokens, value=seg_tokens, attn_mask=attn_mask, need_weights=False
-        )
-        mid = queries + self.dropout(attn_out)
-        ffn_out = self.ffn(self.norm(mid))
-        return mid + self.dropout(ffn_out)
+        def attn_residual_func(
+            q_tokens: Tensor, seg_tokens: Tensor, attn_mask: Optional[Tensor] = None
+        ) -> Tensor:
+            attn_out, _ = self.mha(
+                query=self.norm1(q_tokens),
+                key=seg_tokens,
+                value=seg_tokens,
+                attn_mask=attn_mask,
+                need_weights=False,
+            )
+            return self.ls1(attn_out)
+
+        def ffn_residual_func(q_tokens: Tensor) -> Tensor:
+            return self.ls2(self.ffn(self.norm2(q_tokens)))
+
+        if self.training and self.sample_drop_ratio > 0.1:
+            queries = drop_add_residual_stochastic_depth(
+                queries,
+                residual_func=lambda x_subset: attn_residual_func(
+                    x_subset, seg_tokens, attn_mask=attn_mask
+                ),
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+            queries = drop_add_residual_stochastic_depth(
+                queries,
+                residual_func=ffn_residual_func,
+                sample_drop_ratio=self.sample_drop_ratio,
+            )
+        elif self.training and self.sample_drop_ratio > 0.0:
+            queries = queries + self.drop_path1(
+                attn_residual_func(queries, seg_tokens, attn_mask=attn_mask)
+            )
+            queries = queries + self.drop_path2(ffn_residual_func(queries))
+        else:
+            queries = queries + attn_residual_func(queries, seg_tokens, attn_mask=attn_mask)
+            queries = queries + ffn_residual_func(queries)
+        return queries
 
 
 class SegmentationLayer(nn.Module):
@@ -130,14 +289,45 @@ class SegmentationLayer(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         attn_dropout: float = 0.0,
-        dropout: float = 0.0,
+        drop: float = 0.0,
         patch_grid: Tuple[int, int] | None = None,
+        ln_eps: float = 1e-6,
+        init_values: float | None = None,
+        drop_path: float = 0.0,
     ):
         super().__init__()
-        self.b_block = BottleneckBlock(embed_dim, num_heads, mlp_ratio, attn_dropout, dropout)
-        self.g_block = GSegFromBBlock(embed_dim, num_heads, mlp_ratio, attn_dropout, dropout)
+        self.b_block = BottleneckBlock(
+            embed_dim,
+            num_heads,
+            mlp_ratio,
+            attn_dropout,
+            drop,
+            ln_eps=ln_eps,
+            init_values=init_values,
+            drop_path=drop_path,
+            patch_grid=patch_grid,
+        )
+        self.g_block = GSegFromBBlock(
+            embed_dim,
+            num_heads,
+            mlp_ratio,
+            attn_dropout,
+            drop,
+            ln_eps=ln_eps,
+            init_values=init_values,
+            drop_path=drop_path,
+            patch_grid=patch_grid,
+        )
         self.s_block = SemanticBlock(
-            embed_dim, num_heads, mlp_ratio, attn_dropout, dropout, patch_grid=patch_grid
+            embed_dim,
+            num_heads,
+            mlp_ratio,
+            attn_dropout,
+            drop,
+            patch_grid=patch_grid,
+            ln_eps=ln_eps,
+            init_values=init_values,
+            drop_path=drop_path,
         )
 
     def forward(
