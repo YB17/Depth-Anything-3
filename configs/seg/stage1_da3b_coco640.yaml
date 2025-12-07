@@ -21,15 +21,35 @@ model:
   warmup_steps: [500, 1000]
   poly_power: 0.9
   network:
-    class_path: depth_anything_3.model.da3_eomt_tslora.build_da3_eomt_network_from_config
-    init_args:
-      cfg:
-        # Basic scaffold settings; override via CLI flags if running a custom encoder.
-        embed_dim: 768
-        num_seg_queries: 128
-        num_blocks: 4
-        masked_attn_enabled: true
-        num_classes: ${model.num_classes}
+    class_path: depth_anything_3.model.da3.DepthAnything3Net
+    net:
+      __object__:
+        path: depth_anything_3.model.dinov2.dinov2
+        name: DinoV2
+        args: as_params
+      name: vitb
+      out_layers: [5, 7, 9, 11]
+      alt_start: 4
+      qknorm_start: 4
+      rope_start: 4
+      cat_token: true
+      seg_cfg:
+        enable: true
+        num_bottleneck_tokens: 16
+        num_queries: 100
+        num_masked_layers: ${model.num_masked_layers}
+        layer_start: 6
+        dropout: 0.0
+        attn_dropout: 0.0
+    head:
+      __object__:
+        path: depth_anything_3.model.dualdpt
+        name: DualDPT
+        args: as_params
+      dim_in: 1536
+      output_dim: 2
+      features: 128
+      out_channels: [96, 192, 384, 768]
 
 data:
   root: /home/jovyan/ybai_ws/dataset/dataset/coco
