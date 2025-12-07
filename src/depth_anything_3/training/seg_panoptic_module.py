@@ -106,30 +106,29 @@ class DA3SegPanopticModule(pl.LightningModule):
         total_steps = int(self.trainer.estimated_stepping_batches)
         self._compute_annealing_schedule(total_steps)
 
-    def _mask_prob_for_layer(self, layer_idx: int, global_step: int) -> float:
-        if not self.attn_mask_annealing_enabled or layer_idx >= self.num_masked_layers:
+    def get_mask_prob(self, layer_idx: int, global_step: int) -> float:
+        if not self.training or not self.attn_mask_annealing_enabled or layer_idx >= self.num_masked_layers:
             return 0.0
 
+        step = global_step + layer_idx
         start = self.attn_mask_annealing_start_steps[layer_idx]
         end = self.attn_mask_annealing_end_steps[layer_idx]
-        if global_step < start:
+        if step <= start:
             return 1.0
-        if global_step >= end:
+        if step >= end:
             return 0.0
-        t = (global_step - start) / max(1, end - start)
+        t = (step - start) / max(1, end - start)
         return float((1.0 - t) ** self.mask_annealing_poly_factor)
 
-    def _build_seg_mask_probs(self, global_step: int) -> List[float]:
-        if not self.attn_mask_annealing_enabled or self.num_masked_layers == 0:
-            return []
-        seg_depth = 0
-        if hasattr(self.network, "backbone") and getattr(self.network.backbone, "seg_blocks", None) is not None:
-            seg_depth = len(self.network.backbone.seg_blocks) - self.network.backbone.seg_layer_start
-        probs = [0.0 for _ in range(max(seg_depth, self.num_masked_layers))]
-        for i in range(self.num_masked_layers):
-            target_idx = len(probs) - self.num_masked_layers + i
-            probs[target_idx] = self._mask_prob_for_layer(i, global_step)
-        return probs
+    def build_seg_attn_mask(self, mask_logits: torch.Tensor, prob: float, num_heads: int) -> Optional[torch.Tensor]:
+        if (not self.training) or prob <= 0.0:
+            return None
+        if torch.rand((), device=mask_logits.device) >= prob:
+            return None
+
+        allowed = mask_logits.reshape(mask_logits.shape[0], mask_logits.shape[1], -1) > 0
+        attn_mask = (~allowed).repeat_interleave(num_heads, dim=0)
+        return attn_mask
 
     def _extract_seg_tokens(self, output: Any) -> Dict[str, Any]:
         if isinstance(output, dict):
@@ -139,14 +138,14 @@ class DA3SegPanopticModule(pl.LightningModule):
     def forward(
         self,
         imgs: torch.Tensor,
-        seg_mask_probs: Optional[List[float]] = None,
+        seg_attn_mask_fn=None,
         seg_head_fn=None,
         apply_seg_head_to_intermediate: bool = True,
         apply_seg_head_to_last: bool = True,
     ):
         return self.network(
             imgs,
-            seg_mask_probs=seg_mask_probs,
+            seg_attn_mask_fn=seg_attn_mask_fn,
             seg_head_fn=seg_head_fn,
             apply_seg_head_to_intermediate=apply_seg_head_to_intermediate,
             apply_seg_head_to_last=apply_seg_head_to_last,
@@ -171,10 +170,16 @@ class DA3SegPanopticModule(pl.LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int):
         imgs, targets = batch
-        seg_mask_probs = self._build_seg_mask_probs(self.global_step)
+        seg_attn_mask_fn = None
+        if self.training:
+            seg_attn_mask_fn = lambda mask_logits, layer_idx, num_heads: self.build_seg_attn_mask(  # noqa: E731
+                mask_logits=mask_logits,
+                prob=self.get_mask_prob(layer_idx, self.global_step),
+                num_heads=num_heads,
+            )
         network_out = self(
             imgs,
-            seg_mask_probs=seg_mask_probs,
+            seg_attn_mask_fn=seg_attn_mask_fn,
             seg_head_fn=self.seg_head,
             apply_seg_head_to_intermediate=True,
             apply_seg_head_to_last=True,
@@ -196,7 +201,8 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         total_loss = self.criterion.loss_total(losses_all_blocks, self.log)
         self.log("train_loss", total_loss, prog_bar=True)
-        for i, prob in enumerate(seg_mask_probs[-self.num_masked_layers :] if seg_mask_probs else []):
+        mask_probs = [self.get_mask_prob(i, self.global_step) for i in range(self.num_masked_layers)]
+        for i, prob in enumerate(mask_probs):
             self.log(f"anneal/p_mask_layer_{i}", prob, prog_bar=False)
         return total_loss
 
@@ -204,7 +210,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         imgs, targets = batch
         network_out = self(
             imgs,
-            seg_mask_probs=[],
+            seg_attn_mask_fn=None,
             seg_head_fn=self.seg_head,
             apply_seg_head_to_intermediate=False,
             apply_seg_head_to_last=True,
