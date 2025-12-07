@@ -58,6 +58,9 @@ class DinoV2(nn.Module):
             seg_cfg=seg_cfg,
             **kwargs,
         )
+        
+        self.embed_dim = self.pretrained.embed_dim
+        self.patch_embed = self.pretrained.patch_embed
 
     def forward(self, x, **kwargs):
         return self.pretrained.get_intermediate_layers(

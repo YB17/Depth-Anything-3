@@ -255,8 +255,8 @@ class DinoVisionTransformer(nn.Module):
                             num_heads=num_heads,
                             mlp_ratio=mlp_ratio,
                             attn_dropout=self.seg_attn_dropout,
-                            dropout=self.seg_dropout,
-                            patch_grid=self.patch_embed.grid_size,
+                            drop=self.seg_dropout,
+                            patch_grid=self.patch_embed.patches_resolution,
                         )
                     )
         else:
@@ -425,7 +425,7 @@ class DinoVisionTransformer(nn.Module):
                     G_seg,
                     S_tokens,
                     attn_mask=attn_mask,
-                    patch_grid=self.patch_embed.grid_size,
+                    patch_grid=self.patch_embed.patches_resolution,
                 )
 
                 head_outputs = None
@@ -463,7 +463,7 @@ class DinoVisionTransformer(nn.Module):
                 "B": B_tokens,
                 "G_seg": G_seg,
                 "S": S_tokens,
-                "patch_grid": self.patch_embed.grid_size,
+                "patch_grid": self.patch_embed.patches_resolution,
                 "layers": seg_layer_outputs,
             }
 

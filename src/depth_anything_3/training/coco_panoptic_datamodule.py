@@ -2,17 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import torch
 
-import lightning.pytorch as pl
-from torch.utils.data import DataLoader
-
-from third_party.eomt.datasets.coco_panoptic import CLASS_MAPPING
-from third_party.eomt.datasets.dataset import Dataset
-from third_party.eomt.datasets.transforms import Transforms
+from third_party.eomt.datasets.coco_panoptic_directory import COCOPanopticDirectory, CLASS_MAPPING
 
 
-class COCOPanopticDataModule(pl.LightningDataModule):
-    """Panoptic COCO datamodule aligned with the EoMT dataset API."""
+class COCOPanopticDataModule(COCOPanopticDirectory):
+    """Wrapper for COCOPanopticDirectory with adapted parameters."""
 
     def __init__(
         self,
@@ -28,94 +24,61 @@ class COCOPanopticDataModule(pl.LightningDataModule):
         scale_range: tuple[float, float] = (0.1, 2.0),
         check_empty_targets: bool = True,
     ) -> None:
-        super().__init__()
-        self.root = Path(root)
-        self.panoptic_json_train = Path(panoptic_json_train)
-        self.panoptic_json_val = Path(panoptic_json_val)
-        self.stuff_classes = stuff_classes
-        self.num_classes = num_classes
-        self.img_size = img_size
-        self.batch_size_per_gpu = batch_size_per_gpu
-        self.num_workers = num_workers
-        self.color_jitter_enabled = color_jitter_enabled
-        self.scale_range = scale_range
-        self.check_empty_targets = check_empty_targets
+        # 将参数适配到 COCOPanopticDirectory 的接口
+        super().__init__(
+            path=root,
+            stuff_classes=stuff_classes,
+            num_workers=num_workers,
+            batch_size=batch_size_per_gpu,
+            img_size=img_size,
+            num_classes=num_classes,
+            color_jitter_enabled=color_jitter_enabled,
+            scale_range=scale_range,
+            check_empty_targets=check_empty_targets,
+        )
 
     @staticmethod
     def target_parser(target, labels_by_id, is_crowd_by_id, **kwargs):
+        # 解码RGB编码的segment_id
         target = target[0, :, :] + target[1, :, :] * 256 + target[2, :, :] * 256**2
 
-        masks, labels, is_crowd = [], [], []
+        masks, labels, is_crowd, is_thing, target_ids = [], [], [], [], []
 
         for label_id in target.unique():
-            if label_id.item() not in labels_by_id:
+            lid = label_id.item()
+            if lid not in labels_by_id:
                 continue
 
-            cls_id = labels_by_id[label_id.item()]
+            cls_id = labels_by_id[lid]
             if cls_id not in CLASS_MAPPING:
                 continue
 
             masks.append(target == label_id)
             labels.append(CLASS_MAPPING[cls_id])
-            is_crowd.append(is_crowd_by_id[label_id.item()])
+            is_crowd.append(is_crowd_by_id[lid])
+            # 添加 is_thing 和 target_ids
+            is_thing.append(cls_id < 80)  # COCO中，类别ID < 80 的是thing类
+            target_ids.append(lid)
 
-        return masks, labels, is_crowd
+        return masks, labels, is_crowd, is_thing, target_ids
 
-    def setup(self, stage: str | None = None) -> None:
-        transforms = Transforms(
-            img_size=self.img_size,
-            color_jitter_enabled=self.color_jitter_enabled,
-            scale_range=self.scale_range,
-        )
+    @staticmethod
+    def train_collate(batch):
+        """重写collate函数，添加视图维度 (B, 3, H, W) -> (B, 1, 3, H, W)"""
+        imgs, targets = [], []
 
-        dataset_kwargs: dict[str, Any] = {
-            "img_suffix": ".jpg",
-            "target_suffix": ".png",
-            "target_parser": self.target_parser,
-            "check_empty_targets": self.check_empty_targets,
-        }
+        for img, target in batch:
+            imgs.append(img)
+            targets.append(target)
 
-        self.train_dataset = Dataset(
-            transforms=transforms,
-            img_folder_path_in_zip=Path(self.root, "train2017"),
-            target_folder_path_in_zip=Path(self.root, "panoptic_train2017"),
-            annotations_json_path_in_zip=self.panoptic_json_train,
-            target_zip_path_in_zip=self.panoptic_json_train.parent,
-            target_zip_path=self.panoptic_json_train,
-            zip_path=Path(self.root, "train2017"),
-            **dataset_kwargs,
-        )
-        self.val_dataset = Dataset(
-            transforms=transforms,
-            img_folder_path_in_zip=Path(self.root, "val2017"),
-            target_folder_path_in_zip=Path(self.root, "panoptic_val2017"),
-            annotations_json_path_in_zip=self.panoptic_json_val,
-            target_zip_path_in_zip=self.panoptic_json_val.parent,
-            target_zip_path=self.panoptic_json_val,
-            zip_path=Path(self.root, "val2017"),
-            **dataset_kwargs,
-        )
+        # 堆叠并添加视图维度 N=1
+        imgs_stacked = torch.stack(imgs).unsqueeze(1)  # (B, 3, H, W) -> (B, 1, 3, H, W)
+        return imgs_stacked, targets
 
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size_per_gpu,
-            num_workers=self.num_workers,
-            shuffle=True,
-            drop_last=True,
-            pin_memory=True,
-            persistent_workers=True,
-            collate_fn=self.train_dataset.train_collate,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size_per_gpu,
-            num_workers=self.num_workers,
-            shuffle=False,
-            pin_memory=True,
-            persistent_workers=True,
-            collate_fn=self.val_dataset.eval_collate,
-        )
-
+    @staticmethod
+    def eval_collate(batch):
+        """重写collate函数，添加视图维度"""
+        imgs, targets = zip(*batch)
+        # 堆叠并添加视图维度
+        imgs_stacked = torch.stack(imgs).unsqueeze(1)  # (B, 3, H, W) -> (B, 1, 3, H, W)
+        return imgs_stacked, list(targets)

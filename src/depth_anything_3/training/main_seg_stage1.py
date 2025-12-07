@@ -16,15 +16,17 @@ class SegLightningCLI(cli.LightningCLI):
         parser.link_arguments("data.num_classes", "model.num_classes", apply_on="instantiate")
         parser.link_arguments("data.stuff_classes", "model.stuff_classes", apply_on="instantiate")
 
-    def fit(self, model: pl.LightningModule, datamodule: pl.LightningDataModule, **kwargs):
-        logger = kwargs.get("trainer", {}).get("logger", None)
-        if isinstance(logger, WandbLogger):
-            logger.log_code(".")
-        torch.set_float32_matmul_precision("medium")
-        return super().fit(model=model, datamodule=datamodule, **kwargs)
+    # def fit(self, model: pl.LightningModule, datamodule: pl.LightningDataModule, **kwargs):
+    #     logger = kwargs.get("trainer", {}).get("logger", None)
+    #     if isinstance(logger, WandbLogger):
+    #         logger.log_code(".")
+    #     torch.set_float32_matmul_precision("medium")
+    #     return super().fit(model=model, datamodule=datamodule, **kwargs)
 
 
 def cli_main():
+    torch.set_float32_matmul_precision("medium")
+    
     SegLightningCLI(
         DA3SegPanopticModule,
         COCOPanopticDataModule,

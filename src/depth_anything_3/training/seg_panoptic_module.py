@@ -14,13 +14,16 @@ from third_party.eomt.training.two_stage_warmup_poly_schedule import (
 
 from depth_anything_3.model.segmentation.head_eomt_adapter import EoMTSegHead
 
+from depth_anything_3.model.da3 import DepthAnything3Net
+from depth_anything_3.model.dinov2.dinov2 import DinoV2
+from depth_anything_3.model.dualdpt import DualDPT
 
 class DA3SegPanopticModule(pl.LightningModule):
     """Stage-1 LightningModule for DA3 + segmentation branch panoptic training."""
 
     def __init__(
         self,
-        network: nn.Module,
+        network_config: dict,
         img_size: tuple[int, int],
         num_classes: int,
         stuff_classes: list[int],
@@ -42,7 +45,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         importance_sample_ratio: float = 0.75,
     ) -> None:
         super().__init__()
-        self.network = network
+        self.network = self._build_network(network_config)
         self.img_size = img_size
         self.num_classes = num_classes
         self.stuff_classes = stuff_classes
@@ -64,7 +67,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         embed_dim = getattr(self.network.backbone, "embed_dim", None)
         patch_grid = None
         if hasattr(self.network.backbone, "patch_embed"):
-            patch_grid = getattr(self.network.backbone.patch_embed, "grid_size", None)
+            patch_grid = getattr(self.network.backbone.patch_embed, "patches_resolution", None)
         self.seg_head = EoMTSegHead(
             embed_dim=embed_dim,
             num_queries=num_queries,
@@ -85,6 +88,32 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         self.attn_mask_annealing_start_steps: List[int] = []
         self.attn_mask_annealing_end_steps: List[int] = []
+    
+    def _build_network(self, config: dict) -> nn.Module:
+        """从配置字典构建网络"""
+        # 构建backbone (net)
+        net_config = config.get('net', {})
+        net = DinoV2(
+            name=net_config.get('name', 'vitb'),
+            out_layers=net_config.get('out_layers', [5, 7, 9, 11]),
+            alt_start=net_config.get('alt_start', 4),
+            qknorm_start=net_config.get('qknorm_start', 4),
+            rope_start=net_config.get('rope_start', 4),
+            cat_token=net_config.get('cat_token', True),
+            seg_cfg=net_config.get('seg_cfg'),
+        )
+        
+        # 构建head
+        head_config = config.get('head', {})
+        head = DualDPT(
+            dim_in=head_config.get('dim_in', 1536),
+            output_dim=head_config.get('output_dim', 2),
+            features=head_config.get('features', 128),
+            out_channels=head_config.get('out_channels', [96, 192, 384, 768]),
+        )
+        
+        # 构建完整网络
+        return DepthAnything3Net(net=net, head=head)
 
     def _compute_annealing_schedule(self, total_steps: int) -> None:
         if not self.attn_mask_annealing_enabled or self.num_masked_layers == 0:
