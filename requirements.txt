@@ -20,5 +20,5 @@ e3nn
 moviepy
 plyfile
 pillow_heif
-safetensors
+safetensors>=0.4.0
 pycolmap

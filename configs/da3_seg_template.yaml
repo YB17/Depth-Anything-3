@@ -1,4 +1,5 @@
 model:
+  da3_pretrained_path: ""
   net:
     target: depth_anything_3.model.dinov2.dinov2.DinoV2
     params:

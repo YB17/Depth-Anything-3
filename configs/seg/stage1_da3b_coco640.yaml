@@ -10,6 +10,7 @@ trainer:
   precision: 16-mixed
 
 model:
+  da3_pretrained_path: ""
   network_config:
     net:
       name: vitb

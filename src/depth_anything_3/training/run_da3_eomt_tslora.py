@@ -13,6 +13,10 @@ from depth_anything_3.data.scannet_stage2 import Stage2DataModule
 from depth_anything_3.training.da3_eomt_tslora_module import (
     DA3EoMTTSLoRALightning,
 )
+from depth_anything_3.utils.checkpoint_utils import (
+    load_da3_pretrained_backbone,
+    resolve_da3_ckpt_path,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +48,9 @@ def main() -> None:
     builder = getattr(importlib.import_module(module_name), func_name)
     num_classes = trainer_cfg.get("num_classes")
     network = builder(model_cfg, num_classes=num_classes)
+    ckpt_path = resolve_da3_ckpt_path(model_cfg.get("da3_pretrained_path", "") or "")
+    if ckpt_path and hasattr(network, "backbone"):
+        load_da3_pretrained_backbone(network.backbone, ckpt_path, strict=False)
 
     trainer_cfg.setdefault("lambda_2d", model_cfg.get("lambda_2d", 1.0))
     trainer_cfg.setdefault("lambda_3d", model_cfg.get("lambda_3d", 0.0))
