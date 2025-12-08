@@ -73,6 +73,9 @@ class COCOPanopticDataModule(COCOPanopticDirectory):
 
         # 堆叠并添加视图维度 N=1
         imgs_stacked = torch.stack(imgs).unsqueeze(1)  # (B, 3, H, W) -> (B, 1, 3, H, W)
+        # 🔧 关键修复：将uint8转换为float32，并归一化到[0, 1]
+        if imgs_stacked.dtype == torch.uint8:
+            imgs_stacked = imgs_stacked.float() / 255.0
         return imgs_stacked, targets
 
     @staticmethod
@@ -81,4 +84,8 @@ class COCOPanopticDataModule(COCOPanopticDirectory):
         imgs, targets = zip(*batch)
         # 堆叠并添加视图维度
         imgs_stacked = torch.stack(imgs).unsqueeze(1)  # (B, 3, H, W) -> (B, 1, 3, H, W)
+        # 🔧 关键修复：将uint8转换为float32，并归一化到[0, 1]
+        if imgs_stacked.dtype == torch.uint8:
+            imgs_stacked = imgs_stacked.float() / 255.0
+
         return imgs_stacked, list(targets)

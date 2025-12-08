@@ -57,7 +57,13 @@ class EoMTSegHead(nn.Module):
         class_feats = self.class_head(queries)
         pred_logits = self.logit_head(class_feats)
 
-        patch_map = g_seg.transpose(1, 2).reshape(g_seg.shape[0], -1, *self.patch_grid)
+        # 🔧 关键修复：移除cls_token（第一个token）和任何register tokens
+        # g_seg形状是(B, 1 + num_register_tokens + num_patches, C)
+        # 我们只需要patch tokens
+        num_patches = self.patch_grid[0] * self.patch_grid[1]
+        g_seg_patches = g_seg[:, -num_patches:, :]  # 取最后num_patches个tokens
+        
+        patch_map = g_seg_patches.transpose(1, 2).reshape(g_seg_patches.shape[0], -1, *self.patch_grid)
         mask_logits = torch.einsum("bqc, bchw -> bqhw", self.mask_head(queries), self.upscale(patch_map))
-
+        
         return {"pred_masks": mask_logits, "pred_logits": pred_logits}

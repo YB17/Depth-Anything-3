@@ -9,11 +9,12 @@ python -m depth_anything_3.training.main_seg_stage1 fit \
   --data.root /home/jovyan/ybai_ws/dataset/dataset/coco \
   --data.panoptic_json_train /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_train2017.json \
   --data.panoptic_json_val /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_val2017.json \
-  --trainer.devices 2 \
+  --trainer.devices 8 \
   --trainer.accelerator gpu \
   --trainer.strategy ddp \
   --trainer.precision 16-mixed \
   --model.lr 0.0002 \
   --model.num_masked_layers 4 \
-  --model.attn_mask_annealing_enabled true
+  --model.attn_mask_annealing_enabled true \
+  --model.da3_pretrained_path=/cache/jovyan_cache/model/da3-base/ \
 

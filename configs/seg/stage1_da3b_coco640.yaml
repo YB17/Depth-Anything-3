@@ -6,11 +6,12 @@ trainer:
       name: stage1_da3b_coco640
   devices: 8
   accelerator: gpu
-  strategy: ddp
+  strategy: ddp_find_unused_parameters_true
   precision: 16-mixed
+  max_epochs: 1
 
 model:
-  da3_pretrained_path: ""
+  da3_pretrained_path: "/cache/jovyan_cache/model/da3-base/"
   network_config:
     net:
       name: vitb
@@ -32,22 +33,22 @@ model:
       output_dim: 2
       features: 128
       out_channels: [96, 192, 384, 768]
-  img_size: [640, 640]
+  img_size: [518, 518]
   num_classes: 133
   stuff_classes: []
   attn_mask_annealing_enabled: true
   num_masked_layers: 4
-  lr: 0.0002
-  llrd: 0.8
-  weight_decay: 0.05
-  warmup_steps: [500, 1000]
-  poly_power: 0.9
+  lr:          0.0005      # 从 2e-4 提到 5e-4
+  llrd:        0.8         # 保持不变
+  weight_decay: 0.05       # 保持不变
+  warmup_steps: [1500, 3000]
+  poly_power:  0.9         # 保持不变
 
 data:
   root: /home/jovyan/ybai_ws/dataset/dataset/coco
   panoptic_json_train: /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_train2017.json
   panoptic_json_val: /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_val2017.json
   stuff_classes: []
-  batch_size_per_gpu: 4
+  batch_size_per_gpu: 10
   num_workers: 8
-  img_size: [640, 640]
+  img_size: [518, 518]

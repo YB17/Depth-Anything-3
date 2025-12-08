@@ -72,8 +72,11 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         ckpt_path = resolve_da3_ckpt_path(raw_ckpt_path or "")
         if ckpt_path:
+            # DinoV2 内部的 pretrained 属性才是实际的 DinoVisionTransformer
+            # checkpoint 的键对应的是 DinoVisionTransformer 的结构
+            target_backbone = getattr(self.network.backbone, 'pretrained', self.network.backbone)
             rank_zero_only(load_da3_pretrained_backbone)(
-                self.network.backbone, ckpt_path, strict=False
+                target_backbone, ckpt_path, strict=False
             )
 
         self.num_masked_layers = num_masked_layers
@@ -102,9 +105,46 @@ class DA3SegPanopticModule(pl.LightningModule):
             no_object_coefficient=0.1,
         )
 
+        # ✅ 在这里调用，确保所有组件都已创建
+        self._freeze_pretrained_components()
+
         self.attn_mask_annealing_start_steps: List[int] = []
         self.attn_mask_annealing_end_steps: List[int] = []
-    
+
+    def _freeze_pretrained_components(self):
+        """冻结DA3 backbone和depth head，只训练segmentation相关组件"""
+        
+        # 1. 冻结整个backbone（除了segmentation相关部分）
+        backbone = self.network.backbone
+        if hasattr(backbone, 'pretrained'):
+            backbone = backbone.pretrained
+        
+        for name, param in backbone.named_parameters():
+            # 只有seg_相关的参数保持可训练
+            if 'seg_tokens' in name or 'seg_blocks' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        
+        # 2. 冻结depth head (DualDPT)
+        if hasattr(self.network, 'head') and self.network.head is not None:
+            for param in self.network.head.parameters():
+                param.requires_grad = False
+        
+        # 3. 确保seg_head可训练
+        for param in self.seg_head.parameters():
+            param.requires_grad = True
+        
+        # 4. 打印冻结状态（调试用）
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        frozen_params = total_params - trainable_params
+        
+        from lightning.pytorch.utilities import rank_zero_info
+        rank_zero_info(f"📌 Frozen parameters: {frozen_params:,} ({frozen_params/total_params*100:.1f}%)")
+        rank_zero_info(f"🔥 Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        rank_zero_info(f"📊 Total parameters: {total_params:,}")
+
     def _build_network(self, config: dict) -> nn.Module:
         """从配置字典构建网络"""
         # 构建backbone (net)
@@ -171,7 +211,36 @@ class DA3SegPanopticModule(pl.LightningModule):
         if torch.rand((), device=mask_logits.device) >= prob:
             return None
 
-        allowed = mask_logits.reshape(mask_logits.shape[0], mask_logits.shape[1], -1) > 0
+        # 🔧 关键修复：下采样mask到patch分辨率
+        # mask_logits形状: [B, Q, upscaled_H, upscaled_W]
+        # 需要下采样到 [B, Q, patch_H, patch_W] = [B, Q, 37, 37]
+        import torch.nn.functional as F
+        patch_h, patch_w = self.img_size[0] // 14, self.img_size[1] // 14  # 518 // 14 = 37
+        
+        # 使用adaptive_avg_pool2d下采样到patch分辨率
+        mask_logits_downsampled = F.adaptive_avg_pool2d(
+            mask_logits, 
+            output_size=(patch_h, patch_w)
+        )
+        
+        # reshape: [B, Q, patch_h, patch_w] -> [B, Q, patch_h * patch_w]
+        allowed = mask_logits_downsampled.reshape(
+            mask_logits_downsampled.shape[0], 
+            mask_logits_downsampled.shape[1], 
+            -1
+        ) > 0
+        
+        # 注意：seg_tokens包含1个cls_token + patch_tokens
+        # 需要为cls_token添加一个always-allowed的位置
+        cls_allowed = torch.ones(
+            allowed.shape[0], 
+            allowed.shape[1], 
+            1,  # 为cls_token添加1个位置
+            dtype=allowed.dtype, 
+            device=allowed.device
+        )
+        allowed = torch.cat([cls_allowed, allowed], dim=2)  # [B, Q, 1 + patch_h*patch_w]
+        
         attn_mask = (~allowed).repeat_interleave(num_heads, dim=0)
         return attn_mask
 
@@ -315,6 +384,6 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1,},
         }
 
