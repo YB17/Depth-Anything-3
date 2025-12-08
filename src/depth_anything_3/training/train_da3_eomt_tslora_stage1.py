@@ -36,6 +36,10 @@ import lightning as L
 from lightning.pytorch.loggers import WandbLogger
 
 from depth_anything_3.training.da3_eomt_tslora_module import DA3EoMTTSLoRALightning
+from depth_anything_3.utils.checkpoint_utils import (
+    load_da3_pretrained_backbone,
+    resolve_da3_ckpt_path,
+)
 
 
 # ------------------------------
@@ -126,6 +130,9 @@ def build_lightning_module(cfg: Dict[str, Any]) -> DA3EoMTTSLoRALightning:
 
     num_classes = trainer_cfg.get("num_classes", data_cfg.get("num_classes", 133))
     network = builder(model_cfg, num_classes=num_classes)
+    ckpt_path = resolve_da3_ckpt_path(model_cfg.get("da3_pretrained_path", "") or "")
+    if ckpt_path and hasattr(network, "backbone"):
+        load_da3_pretrained_backbone(network.backbone, ckpt_path, strict=False)
 
     lightning_kwargs = dict(
         network=network,

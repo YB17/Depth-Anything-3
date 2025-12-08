@@ -6,6 +6,7 @@ import lightning.pytorch as pl
 import torch
 from torch import nn
 from torch.optim import AdamW
+from lightning.pytorch.utilities import rank_zero_only
 
 from third_party.eomt.training.mask_classification_loss import MaskClassificationLoss
 from third_party.eomt.training.two_stage_warmup_poly_schedule import (
@@ -17,6 +18,10 @@ from depth_anything_3.model.segmentation.head_eomt_adapter import EoMTSegHead
 from depth_anything_3.model.da3 import DepthAnything3Net
 from depth_anything_3.model.dinov2.dinov2 import DinoV2
 from depth_anything_3.model.dualdpt import DualDPT
+from depth_anything_3.utils.checkpoint_utils import (
+    load_da3_pretrained_backbone,
+    resolve_da3_ckpt_path,
+)
 
 class DA3SegPanopticModule(pl.LightningModule):
     """Stage-1 LightningModule for DA3 + segmentation branch panoptic training."""
@@ -27,6 +32,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         img_size: tuple[int, int],
         num_classes: int,
         stuff_classes: list[int],
+        da3_pretrained_path: str = "",
         attn_mask_annealing_enabled: bool = True,
         num_masked_layers: int | None = None,
         mask_annealing_poly_factor: float = 0.9,
@@ -59,6 +65,16 @@ class DA3SegPanopticModule(pl.LightningModule):
         self.poly_power = poly_power
 
         self.save_hyperparameters(ignore=["network"])
+
+        raw_ckpt_path = getattr(self.hparams, "da3_pretrained_path", "")
+        if hasattr(self.hparams, "model"):
+            raw_ckpt_path = getattr(self.hparams.model, "da3_pretrained_path", raw_ckpt_path)
+
+        ckpt_path = resolve_da3_ckpt_path(raw_ckpt_path or "")
+        if ckpt_path:
+            rank_zero_only(load_da3_pretrained_backbone)(
+                self.network.backbone, ckpt_path, strict=False
+            )
 
         self.num_masked_layers = num_masked_layers
         if self.num_masked_layers is None:

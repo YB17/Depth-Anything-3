@@ -150,6 +150,18 @@ da3 auto assets/examples/SOH \
 
 ```
 
+### 🧪 Training with DA3 + EoMT segmentation
+
+You can initialize the DA3 backbone from the official safetensors checkpoints by pointing
+`model.da3_pretrained_path` to the file or directory containing the weights. For example:
+
+```bash
+python -m depth_anything_3.training.main_seg_stage1 \
+  --config configs/seg/stage1_da3b_coco640.yaml \
+  --model.da3_pretrained_path=/cache/jovyan_cache/model/da3-base/ \
+  --trainer.devices=8 --trainer.accelerator=gpu
+```
+
 The model architecture is defined in [`DepthAnything3Net`](src/depth_anything_3/model/da3.py), and specified with a Yaml config file located at [`src/depth_anything_3/configs`](src/depth_anything_3/configs). The input and output processing are handled by [`DepthAnything3`](src/depth_anything_3/api.py). To customize the model architecture, simply create a new config file (*e.g.*, `path/to/new/config`) as:
 
 ```yaml
