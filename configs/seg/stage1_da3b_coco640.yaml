@@ -8,7 +8,7 @@ trainer:
   accelerator: gpu
   strategy: ddp_find_unused_parameters_true
   precision: 16-mixed
-  max_epochs: 10
+  max_epochs: 20
   # 🔧 添加callbacks配置
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -58,14 +58,14 @@ model:
   num_masked_layers: 4
   lr:          0.0004      # 从 2e-4 提到 4e-4
   llrd:        0.8         # 保持不变
-  weight_decay: 0.05       # 保持不变
-  warmup_steps: [500, 1000]
+  weight_decay: 0.04       # 保持不变
+  warmup_steps: [1000, 2000]
   poly_power:  0.9         # 保持不变
 
 data:
   root: /home/jovyan/ybai_ws/dataset/dataset/coco
-  panoptic_json_train: /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_train2017.json
-  panoptic_json_val: /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_val2017.json
+  panoptic_json_train: /home/jovyan/ybai_ws/dataset/dataset/coco/annotations/panoptic_train2017.json
+  panoptic_json_val: /home/jovyan/ybai_ws/dataset/dataset/coco/annotations/panoptic_val2017.json
   stuff_classes: []
   batch_size_per_gpu: 10
   num_workers: 8

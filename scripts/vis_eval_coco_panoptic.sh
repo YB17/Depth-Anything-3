@@ -4,17 +4,18 @@
 set -euo pipefail
 
 # Update these paths before running
-CKPT_PATH="/path/to/your_checkpoint.ckpt"
-CONFIG_PATH="configs/seg_panoptic/your_config.yaml"
+CKPT_PATH="/cache/model/stage1_da3b_coco640/last.ckpt"
+CONFIG_PATH="/home/jovyan/ybai_ws/Depth-Anything-3/configs/seg/stage1_da3b_coco640.yaml"
 SAVE_DIR="outputs/panoptic_vis"
 DEVICE="cuda:0"
 NUM_SAMPLES=16
 
-python tools/vis_and_eval_coco_panoptic.py \
+python -m tools.vis_and_eval_coco_panoptic \
   --ckpt "${CKPT_PATH}" \
   --config "${CONFIG_PATH}" \
   --num-samples "${NUM_SAMPLES}" \
   --save-dir "${SAVE_DIR}" \
   --device "${DEVICE}" \
-  --mask-thresh 0.8 \
-  --overlap-thresh 0.8
+  --mask-thresh 0.25 \
+  --overlap-thresh 0.25 \
+  --max-samples 16

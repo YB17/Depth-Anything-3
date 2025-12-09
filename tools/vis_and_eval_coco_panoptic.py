@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0", help="Computation device (e.g., cuda:0 or cpu)")
     parser.add_argument("--mask-thresh", type=float, default=0.8, help="Mask confidence threshold")
     parser.add_argument("--overlap-thresh", type=float, default=0.8, help="Minimum overlap ratio for valid segments")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum number of samples to process")
     return parser.parse_args()
 
 
@@ -229,6 +230,7 @@ def generate_predictions(
     inverse_class_map: Dict[int, int],
     mask_thresh: float,
     overlap_thresh: float,
+    max_samples: int = None,
 ) -> tuple[Path, Path]:
     pred_dir = save_dir / "panoptic_preds"
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -236,6 +238,7 @@ def generate_predictions(
 
     predictions = []
     val_loader = datamodule.val_dataloader()
+    processed = 0
     for batch in val_loader:
         batch_results = postprocess_batch(
             model,
@@ -259,6 +262,10 @@ def generate_predictions(
                     "segments_info": segments_info,
                 }
             )
+            processed += 1
+
+        if max_samples is not None and processed >= max_samples:  # ← 外层也检查
+            break
 
     with pred_json.open("w") as f:
         json.dump(predictions, f)
@@ -318,6 +325,7 @@ def main():
         inverse_class_map=inverse_class_map,
         mask_thresh=args.mask_thresh,
         overlap_thresh=args.overlap_thresh,
+        max_samples=args.max_samples,
     )
 
     compute_pq(cfg, pred_json, pred_dir)
