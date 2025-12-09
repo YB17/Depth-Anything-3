@@ -1,0 +1,9 @@
+# Example configuration for running tools/vis_and_eval_coco_panoptic.py
+# Update ckpt to your trained checkpoint and adjust dataset paths if necessary.
+ckpt: /path/to/your_checkpoint.ckpt
+config: configs/seg/stage1_da3b_coco640.yaml
+save_dir: outputs/panoptic_vis
+device: cuda:0
+num_samples: 16
+mask_thresh: 0.8
+overlap_thresh: 0.8
