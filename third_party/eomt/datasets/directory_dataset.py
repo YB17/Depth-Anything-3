@@ -277,6 +277,8 @@ class DirectoryDataset(torch.utils.data.Dataset):
             "is_thing": torch.tensor(is_thing),
             "target_ids": torch.tensor(target_ids),
             "image_id": image_id,  # 🔧 添加图像ID到target字典中
+            "file_name": img_path.name,
+            "orig_size": (img.shape[-2], img.shape[-1]),
         }
 
         if self.transforms is not None:
