@@ -303,6 +303,17 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         return head_outputs
 
+    def _create_log_wrapper(self, prefix: str):
+        """创建带前缀的log包装函数"""
+        def log_fn(name, value, **kwargs):
+            # 确保使用正确的前缀
+            if name.startswith("losses/train_"):
+                name = name.replace("losses/train_", f"losses/{prefix}_")
+            elif not name.startswith("losses/"):
+                pass  # 保持原样
+            self.log(name, value, **kwargs)
+        return log_fn
+
     def training_step(self, batch: Any, batch_idx: int):
         imgs, targets = batch
         seg_attn_mask_fn = None
@@ -334,8 +345,12 @@ class DA3SegPanopticModule(pl.LightningModule):
             for key, value in losses.items():
                 losses_all_blocks[f"{key}_b{i}"] = value
 
-        total_loss = self.criterion.loss_total(losses_all_blocks, self.log)
-        self.log("train_loss", total_loss, prog_bar=True)
+        total_loss = self.criterion.loss_total(
+            losses_all_blocks, 
+            self._create_log_wrapper("train")  # ← 使用train前缀
+        )
+        self.log("train_loss", total_loss, prog_bar=True, sync_dist=True)
+
         mask_probs = [self.get_mask_prob(i, self.global_step) for i in range(self.num_masked_layers)]
         for i, prob in enumerate(mask_probs):
             self.log(f"anneal/p_mask_layer_{i}", prob, prog_bar=False)
@@ -364,8 +379,13 @@ class DA3SegPanopticModule(pl.LightningModule):
             )
             for key, value in losses.items():
                 losses_all_blocks[f"{key}_b{i}"] = value
-        total_loss = self.criterion.loss_total(losses_all_blocks, self.log)
-        self.log("val_loss", total_loss, prog_bar=True)
+
+        total_loss = self.criterion.loss_total(
+            losses_all_blocks, 
+            self._create_log_wrapper("val")  # ← 使用val前缀
+        )
+        self.log("val_loss", total_loss, prog_bar=True, sync_dist=True)
+
         return total_loss
 
     def configure_optimizers(self):
