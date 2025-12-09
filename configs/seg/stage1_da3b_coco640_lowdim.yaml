@@ -3,7 +3,7 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: da3_seg_coco
-      name: stage1_da3b_coco640
+      name: stage1_da3b_coco640_lowdim
   devices: 8
   accelerator: gpu
   strategy: ddp_find_unused_parameters_true
@@ -12,7 +12,7 @@ trainer:
 
 model:
   seg_adapter:
-    enable_lowdim: false
+    enable_lowdim: true
     dim: 256
     shared_layers: true
   da3_pretrained_path: "/cache/jovyan_cache/model/da3-base/"
@@ -42,11 +42,11 @@ model:
   stuff_classes: []
   attn_mask_annealing_enabled: true
   num_masked_layers: 4
-  lr:          0.0005      # 从 2e-4 提到 5e-4
-  llrd:        0.8         # 保持不变
-  weight_decay: 0.05       # 保持不变
+  lr:          0.0005
+  llrd:        0.8
+  weight_decay: 0.05
   warmup_steps: [1500, 3000]
-  poly_power:  0.9         # 保持不变
+  poly_power:  0.9
 
 data:
   root: /home/jovyan/ybai_ws/dataset/dataset/coco

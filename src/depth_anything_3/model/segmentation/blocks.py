@@ -351,3 +351,75 @@ class SegmentationLayer(nn.Module):
             patch_grid=patch_grid,
         )
         return bottleneck_tokens, seg_tokens, queries
+
+
+class SegAdapterLayer(nn.Module):
+    """A shared lightweight adapter stacking B, G_seg, and S updates."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        attn_dropout: float = 0.0,
+        drop: float = 0.0,
+        ln_eps: float = 1e-6,
+        init_values: float | None = None,
+        drop_path: float = 0.0,
+        patch_grid: Tuple[int, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.b_block = BottleneckBlock(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            attn_dropout=attn_dropout,
+            drop=drop,
+            ln_eps=ln_eps,
+            init_values=init_values,
+            drop_path=drop_path,
+            patch_grid=patch_grid,
+        )
+        self.g_block = GSegFromBBlock(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            attn_dropout=attn_dropout,
+            drop=drop,
+            ln_eps=ln_eps,
+            init_values=init_values,
+            drop_path=drop_path,
+            patch_grid=patch_grid,
+        )
+        self.s_block = SemanticBlock(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            attn_dropout=attn_dropout,
+            drop=drop,
+            patch_grid=patch_grid,
+            ln_eps=ln_eps,
+            init_values=init_values,
+            drop_path=drop_path,
+        )
+
+    def forward(
+        self,
+        geom_tokens_seg: Tensor,
+        bottleneck_tokens: Tensor,
+        query_tokens: Tensor,
+        attn_masks: dict[str, Optional[Tensor]] | None = None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        attn_masks = attn_masks or {}
+        m_b = attn_masks.get("b", None)
+        m_g = attn_masks.get("g", None)
+        m_s = attn_masks.get("s", None)
+
+        bottleneck_tokens = self.b_block(
+            geom_tokens=geom_tokens_seg, bottleneck_tokens=bottleneck_tokens, attn_mask=m_b
+        )
+        geom_tokens_seg = self.g_block(
+            geom_tokens=geom_tokens_seg, bottleneck_tokens=bottleneck_tokens, attn_mask=m_g
+        )
+        query_tokens = self.s_block(queries=query_tokens, seg_tokens=geom_tokens_seg, attn_mask=m_s)
+        return geom_tokens_seg, bottleneck_tokens, query_tokens
