@@ -160,6 +160,11 @@ python -m depth_anything_3.training.main_seg_stage1 \
   --config configs/seg/stage1_da3b_coco640.yaml \
   --model.da3_pretrained_path=/cache/jovyan_cache/model/da3-base/ \
   --trainer.devices=8 --trainer.accelerator=gpu
+
+# Resume a previous run from a checkpoint (e.g., last.ckpt)
+python -m depth_anything_3.training.main_seg_stage1 \
+  --config configs/seg/stage1_da3b_coco640.yaml \
+  --ckpt_path=checkpoints/stage1_da3b_coco640/last.ckpt
 ```
 
 The model architecture is defined in [`DepthAnything3Net`](src/depth_anything_3/model/da3.py), and specified with a Yaml config file located at [`src/depth_anything_3/configs`](src/depth_anything_3/configs). The input and output processing are handled by [`DepthAnything3`](src/depth_anything_3/api.py). To customize the model architecture, simply create a new config file (*e.g.*, `path/to/new/config`) as:

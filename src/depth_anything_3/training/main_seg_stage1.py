@@ -34,12 +34,14 @@ class SegLightningCLI(cli.LightningCLI):
 
         super().instantiate_classes()
 
-    # def fit(self, model: pl.LightningModule, datamodule: pl.LightningDataModule, **kwargs):
-    #     logger = kwargs.get("trainer", {}).get("logger", None)
-    #     if isinstance(logger, WandbLogger):
-    #         logger.log_code(".")
-    #     torch.set_float32_matmul_precision("medium")
-    #     return super().fit(model=model, datamodule=datamodule, **kwargs)
+    def fit(self, model: pl.LightningModule, datamodule: pl.LightningDataModule, **kwargs):
+        ckpt_path = kwargs.pop("ckpt_path", None)
+        if ckpt_path is None:
+            ckpt_path = getattr(self.config, "ckpt_path", None)
+        if ckpt_path in ("", "null"):
+            ckpt_path = None
+
+        return super().fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path, **kwargs)
 
 
 def cli_main():
