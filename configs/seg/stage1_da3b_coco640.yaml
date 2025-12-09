@@ -1,3 +1,6 @@
+# Optional checkpoint path for resuming training
+ckpt_path: null
+
 trainer:
   logger:
     class_path: lightning.pytorch.loggers.WandbLogger
