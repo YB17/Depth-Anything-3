@@ -37,7 +37,7 @@ model:
   da3_pretrained_path: "/cache/model/da3/"
   network_config:
     enable_dino_teacher: true
-    dino_teacher_ckpt: "/cache/model/dinov3/vitb16.pth"
+    dino_teacher_ckpt: "/cache/model/dinov3/dinov3_vitb16_pretrain.pth"
     gram_layers: [5, 7, 9, 11]
     lambda_gram: 1.0
     dino_d_base: 384
