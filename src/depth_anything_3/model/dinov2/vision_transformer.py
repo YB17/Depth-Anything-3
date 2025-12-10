@@ -16,7 +16,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 
 from depth_anything_3.utils.logger import logger
-from depth_anything_3.model.segmentation.blocks import SegmentationLayer
+from depth_anything_3.model.segmentation.blocks import SegSemanticAdapter, SegmentationLayer
 from depth_anything_3.model.segmentation.tokens import SegmentationTokens
 from depth_anything_3.model.dinov2.layers.block import drop_add_residual_stochastic_depth
 from depth_anything_3.model.dinov2.layers.drop_path import DropPath
@@ -238,12 +238,25 @@ class DinoVisionTransformer(nn.Module):
         self.seg_dropout = seg_cfg.get("dropout", 0.0)
         self.seg_attn_dropout = seg_cfg.get("attn_dropout", 0.0)
         self.num_seg_masked_layers = seg_cfg.get("num_masked_layers", 0)
+        self.enable_dino_teacher = seg_cfg.get("enable_dino_teacher", False)
+        self.distill_layers = set(seg_cfg.get("distill_layers", []))
+        adapter_d_base = seg_cfg.get("dino_d_base", embed_dim)
+        adapter_d_teacher = seg_cfg.get("dino_teacher_dim", embed_dim)
+        adapter_d_seg = seg_cfg.get("dino_seg_dim", embed_dim)
+        self.seg_adapter = None
         if self.enable_seg:
             self.seg_tokens = SegmentationTokens(
                 embed_dim=embed_dim,
                 num_bottleneck_tokens=self.num_bottleneck_tokens,
                 num_queries=self.num_seg_queries,
             )
+            if seg_cfg.get("enable_seg_adapter", self.enable_dino_teacher):
+                self.seg_adapter = SegSemanticAdapter(
+                    embed_dim=embed_dim,
+                    d_base=adapter_d_base,
+                    d_teacher=adapter_d_teacher,
+                    d_seg=adapter_d_seg,
+                )
             self.seg_blocks = nn.ModuleList()
             for i in range(depth):
                 if i < self.seg_layer_start:
@@ -364,6 +377,7 @@ class DinoVisionTransformer(nn.Module):
 
         seg_output = None
         seg_layer_outputs = []
+        distill_tokens = {}
         if self.enable_seg:
             seg_geom = rearrange(x, "b s n c -> (b s) n c")
             B_tokens, G_seg, S_tokens = self.seg_tokens(seg_geom)
@@ -414,6 +428,16 @@ class DinoVisionTransformer(nn.Module):
             if self.enable_seg and i >= self.seg_layer_start:
                 seg_idx = i - self.seg_layer_start
                 geom_for_seg = rearrange(local_x, "b s n c -> (b s) n c")
+                patch_start = self.patch_start_idx + self.num_register_tokens
+                if self.seg_adapter is not None:
+                    geom_prefix = geom_for_seg[:, :patch_start, :]
+                    geom_patches = geom_for_seg[:, patch_start:, :]
+                    _, z_teacher, z_seg = self.seg_adapter(geom_patches)
+                    geom_for_seg = torch.cat([geom_prefix, z_seg], dim=1)
+                    if i in self.distill_layers:
+                        distill_tokens[i] = z_teacher
+                elif i in self.distill_layers:
+                    distill_tokens[i] = geom_for_seg[:, patch_start:, :]
                 attn_mask = None
                 if (
                     self.training
@@ -468,6 +492,7 @@ class DinoVisionTransformer(nn.Module):
                 "S": S_tokens,
                 "patch_grid": self.patch_embed.patches_resolution,
                 "layers": seg_layer_outputs,
+                "distill_tokens": distill_tokens,
             }
 
         return output, aux_output, seg_output

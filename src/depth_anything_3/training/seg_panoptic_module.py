@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import lightning.pytorch as pl
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from lightning.pytorch.utilities import rank_zero_only
 
@@ -12,12 +13,14 @@ from third_party.eomt.training.mask_classification_loss import MaskClassificatio
 from third_party.eomt.training.two_stage_warmup_poly_schedule import (
     TwoStageWarmupPolySchedule,
 )
+from third_party.dinov3.loss.gram_loss import GramLoss
 
 from depth_anything_3.model.segmentation.head_eomt_adapter import EoMTSegHead
 
 from depth_anything_3.model.da3 import DepthAnything3Net
 from depth_anything_3.model.dinov2.dinov2 import DinoV2
 from depth_anything_3.model.dualdpt import DualDPT
+from depth_anything_3.model.teacher.dinov3_teacher import DINOv3Teacher
 from depth_anything_3.utils.checkpoint_utils import (
     load_da3_pretrained_backbone,
     resolve_da3_ckpt_path,
@@ -66,6 +69,21 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         self.save_hyperparameters(ignore=["network"])
 
+        teacher_cfg = getattr(self.hparams, "model", None)
+        teacher_cfg = getattr(teacher_cfg, "teacher", teacher_cfg)
+        self.enable_dino_teacher = network_config.get(
+            "enable_dino_teacher", getattr(teacher_cfg, "enable_dino_teacher", False)
+        )
+        self.dino_teacher_ckpt = network_config.get(
+            "dino_teacher_ckpt", getattr(teacher_cfg, "dino_teacher_ckpt", "")
+        )
+        self.gram_layers = network_config.get(
+            "gram_layers", getattr(teacher_cfg, "gram_layers", [5, 7, 9, 11])
+        )
+        self.lambda_gram = float(
+            network_config.get("lambda_gram", getattr(teacher_cfg, "lambda_gram", 1.0))
+        )
+
         raw_ckpt_path = getattr(self.hparams, "da3_pretrained_path", "")
         if hasattr(self.hparams, "model"):
             raw_ckpt_path = getattr(self.hparams.model, "da3_pretrained_path", raw_ckpt_path)
@@ -111,6 +129,22 @@ class DA3SegPanopticModule(pl.LightningModule):
         self.attn_mask_annealing_start_steps: List[int] = []
         self.attn_mask_annealing_end_steps: List[int] = []
 
+        if self.enable_dino_teacher:
+            self.dino_teacher = DINOv3Teacher(
+                ckpt_path=self.dino_teacher_ckpt,
+                img_size=592,
+                layers=self.gram_layers,
+                patch_size=16,
+            )
+            self.gram_loss = GramLoss()
+        else:
+            self.dino_teacher = None
+            self.gram_loss = None
+
+        self.print(
+            f"[DINOv3 teacher] enable={self.enable_dino_teacher}, gram_layers={self.gram_layers}, lambda_gram={self.lambda_gram}"
+        )
+
     def _freeze_pretrained_components(self):
         """冻结DA3 backbone和depth head，只训练segmentation相关组件"""
         
@@ -121,7 +155,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         
         for name, param in backbone.named_parameters():
             # 只有seg_相关的参数保持可训练
-            if 'seg_tokens' in name or 'seg_blocks' in name:
+            if 'seg_tokens' in name or 'seg_blocks' in name or 'seg_adapter' in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
@@ -324,16 +358,51 @@ class DA3SegPanopticModule(pl.LightningModule):
             for key, value in losses.items():
                 losses_all_blocks[f"{key}_b{i}"] = value
 
-        total_loss = self.criterion.loss_total(
-            losses_all_blocks, 
+        loss_seg = self.criterion.loss_total(
+            losses_all_blocks,
             self._create_log_wrapper("train")  # ← 使用train前缀
         )
-        self.log("train_loss", total_loss, prog_bar=True, sync_dist=True)
+        loss_total = loss_seg
+        loss_gram = torch.tensor(0.0, device=loss_seg.device)
+
+        if self.enable_dino_teacher and self.gram_loss is not None:
+            student_tokens = seg_tokens.get("distill_tokens", {})
+            if student_tokens:
+                imgs_teacher = F.interpolate(
+                    imgs,
+                    size=(592, 592),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                with torch.no_grad():
+                    teacher_feats = self.dino_teacher(imgs_teacher)
+
+                for l in self.gram_layers:
+                    if l not in student_tokens or l not in teacher_feats:
+                        continue
+                    z_t = student_tokens[l]
+                    t_l = teacher_feats[l]
+                    assert (
+                        z_t.shape[1] == t_l.shape[1]
+                    ), f"Mismatch in tokens: student={z_t.shape[1]}, teacher={t_l.shape[1]}"
+                    b_s, t_s, c = z_t.shape
+                    h = w = int(t_s**0.5)
+                    z_t_map = z_t.view(b_s, h, w, c).permute(0, 3, 1, 2).contiguous()
+                    t_l_map = t_l.view(b_s, h, w, c).permute(0, 3, 1, 2).contiguous()
+                    loss_gram = loss_gram + self.gram_loss(z_t_map, t_l_map)
+                if len(self.gram_layers) > 0:
+                    loss_gram = loss_gram / len(self.gram_layers)
+                loss_total = loss_total + self.lambda_gram * loss_gram
+
+        self.log("train_loss", loss_total, prog_bar=True, sync_dist=True)
+        self.log("losses/train_seg", loss_seg, prog_bar=False, sync_dist=True)
+        if self.enable_dino_teacher:
+            self.log("losses/train_gram", loss_gram, prog_bar=False, sync_dist=True)
 
         mask_probs = [self.get_mask_prob(i, self.global_step) for i in range(self.num_masked_layers)]
         for i, prob in enumerate(mask_probs):
             self.log(f"anneal/p_mask_layer_{i}", prob, prog_bar=False)
-        return total_loss
+        return loss_total
 
     def validation_step(self, batch: Any, batch_idx: int):
         imgs, targets = batch
