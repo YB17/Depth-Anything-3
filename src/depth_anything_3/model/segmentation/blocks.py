@@ -30,6 +30,34 @@ class _FFN(nn.Module):
         return self.net(x)
 
 
+class SegSemanticAdapter(nn.Module):
+    """Adapter that maps geometry tokens to teacher and segmentation subspaces."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        d_base: int = 384,
+        d_teacher: int = 768,
+        d_seg: int = 768,
+    ):
+        super().__init__()
+        self.ln = nn.LayerNorm(embed_dim)
+        self.mlp_base = nn.Sequential(
+            nn.Linear(embed_dim, d_base),
+            nn.GELU(),
+            nn.Linear(d_base, d_base),
+        )
+        self.proj_teacher = nn.Linear(d_base, d_teacher)
+        self.proj_seg = nn.Linear(d_base, d_seg)
+
+    def forward(self, geom_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        geom_tokens = self.ln(geom_tokens)
+        z_base = self.mlp_base(geom_tokens)
+        z_teacher = self.proj_teacher(z_base)
+        z_seg = self.proj_seg(z_base)
+        return z_base, z_teacher, z_seg
+
+
 class BottleneckBlock(nn.Module):
     """Cross-attend bottleneck tokens to geometry tokens then apply FFN."""
 

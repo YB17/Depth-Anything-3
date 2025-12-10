@@ -36,6 +36,11 @@ trainer:
 model:
   da3_pretrained_path: "/cache/model/da3/"
   network_config:
+    enable_dino_teacher: true
+    dino_teacher_ckpt: "/cache/model/dinov3/vitb16.pth"
+    gram_layers: [5, 7, 9, 11]
+    lambda_gram: 1.0
+    dino_d_base: 384
     net:
       name: vitb
       out_layers: [5, 7, 9, 11]
@@ -51,6 +56,12 @@ model:
         layer_start: 6
         dropout: 0.0
         attn_dropout: 0.0
+        enable_dino_teacher: true
+        distill_layers: [5, 7, 9, 11]
+        dino_d_base: 384
+        dino_teacher_dim: 768
+        dino_seg_dim: 768
+        enable_seg_adapter: true
     head:
       dim_in: 1536
       output_dim: 2
