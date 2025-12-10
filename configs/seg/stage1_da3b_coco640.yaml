@@ -70,6 +70,9 @@ model:
   img_size: [518, 518]
   num_classes: 133
   stuff_classes: []
+  enable_panoptic_eval: true
+  mask_thresh: 0.8
+  overlap_thresh: 0.8
   attn_mask_annealing_enabled: false
   num_masked_layers: 4
   lr:          0.0004      # 从 2e-4 提到 4e-4
