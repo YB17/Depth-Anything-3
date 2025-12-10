@@ -398,6 +398,9 @@ class DinoVisionTransformer(nn.Module):
                     attn_mask=kwargs.get("attn_mask", None),
                     token_mask=token_mask_for_lora,
                 )
+                # ✅ 单视角时：global 也更新 local_x
+                if S == 1:
+                    local_x = x
             else:
                 x = self.process_attention(
                     x,

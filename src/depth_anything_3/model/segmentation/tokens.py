@@ -19,8 +19,10 @@ class SegmentationTokens(nn.Module):
         self.num_bottleneck_tokens = num_bottleneck_tokens
         self.num_queries = num_queries
 
-        self.bottleneck = nn.Parameter(torch.zeros(1, num_bottleneck_tokens, embed_dim))
-        self.queries = nn.Parameter(torch.zeros(1, num_queries, embed_dim))
+        # self.bottleneck = nn.Parameter(torch.zeros(1, num_bottleneck_tokens, embed_dim))
+        self.bottleneck = nn.Parameter(torch.empty(1, num_bottleneck_tokens, embed_dim))
+        nn.init.trunc_normal_(self.bottleneck, std=0.02)
+        self.queries = nn.Parameter(torch.empty(1, num_queries, embed_dim))
         nn.init.trunc_normal_(self.queries, std=0.02)
 
     def forward(self, geom_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -35,7 +37,10 @@ class SegmentationTokens(nn.Module):
         """
 
         batch = geom_tokens.shape[0]
-        B0 = self.bottleneck.expand(batch, -1, -1).to(device=geom_tokens.device, dtype=geom_tokens.dtype)
+        B0 = self.bottleneck.expand(batch, -1, -1).type_as(geom_tokens)
+        S0 = self.queries.expand(batch, -1, -1).type_as(geom_tokens)
+
+        # B0 = self.bottleneck.expand(batch, -1, -1).to(device=geom_tokens.device, dtype=geom_tokens.dtype)
         G_seg0 = geom_tokens.detach().clone()
-        S0 = self.queries.expand(batch, -1, -1).to(device=geom_tokens.device, dtype=geom_tokens.dtype)
+        # S0 = self.queries.expand(batch, -1, -1).to(device=geom_tokens.device, dtype=geom_tokens.dtype)
         return B0, G_seg0, S0

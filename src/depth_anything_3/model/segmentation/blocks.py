@@ -12,7 +12,7 @@ from torch import Tensor, nn
 # )
 from depth_anything_3.model.dinov2.layers.drop_path import DropPath
 from depth_anything_3.model.dinov2.layers.layer_scale import LayerScale
-from depth_anything_3.model.dinov2.layers.block import drop_add_residual_stochastic_depth
+# from depth_anything_3.model.dinov2.layers.block import drop_add_residual_stochastic_depth
 
 class _FFN(nn.Module):
     def __init__(self, embed_dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
@@ -87,21 +87,8 @@ class BottleneckBlock(nn.Module):
 
         def ffn_residual_func(b_tokens: Tensor) -> Tensor:
             return self.ls2(self.ffn(self.norm2(b_tokens)))
-
-        if self.training and self.sample_drop_ratio > 0.1:
-            bottleneck_tokens = drop_add_residual_stochastic_depth(
-                bottleneck_tokens,
-                residual_func=lambda x_subset: attn_residual_func(
-                    x_subset, geom_tokens, attn_mask=attn_mask
-                ),
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-            bottleneck_tokens = drop_add_residual_stochastic_depth(
-                bottleneck_tokens,
-                residual_func=ffn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-        elif self.training and self.sample_drop_ratio > 0.0:
+   
+        if self.training and self.sample_drop_ratio > 0.0:
             bottleneck_tokens = bottleneck_tokens + self.drop_path1(
                 attn_residual_func(bottleneck_tokens, geom_tokens, attn_mask=attn_mask)
             )
@@ -174,20 +161,7 @@ class GSegFromBBlock(nn.Module):
         def ffn_residual_func(g_tokens: Tensor) -> Tensor:
             return self.ls2(self.ffn(self.norm2(g_tokens)))
 
-        if self.training and self.sample_drop_ratio > 0.1:
-            seg_tokens = drop_add_residual_stochastic_depth(
-                seg_tokens,
-                residual_func=lambda x_subset: attn_residual_func(
-                    x_subset, bottleneck_tokens, attn_mask=attn_mask
-                ),
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-            seg_tokens = drop_add_residual_stochastic_depth(
-                seg_tokens,
-                residual_func=ffn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-        elif self.training and self.sample_drop_ratio > 0.0:
+        if self.training and self.sample_drop_ratio > 0.0:
             seg_tokens = seg_tokens + self.drop_path1(
                 attn_residual_func(seg_tokens, bottleneck_tokens, attn_mask=attn_mask)
             )
@@ -259,20 +233,7 @@ class SemanticBlock(nn.Module):
         def ffn_residual_func(q_tokens: Tensor) -> Tensor:
             return self.ls2(self.ffn(self.norm2(q_tokens)))
 
-        if self.training and self.sample_drop_ratio > 0.1:
-            queries = drop_add_residual_stochastic_depth(
-                queries,
-                residual_func=lambda x_subset: attn_residual_func(
-                    x_subset, seg_tokens, attn_mask=attn_mask
-                ),
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-            queries = drop_add_residual_stochastic_depth(
-                queries,
-                residual_func=ffn_residual_func,
-                sample_drop_ratio=self.sample_drop_ratio,
-            )
-        elif self.training and self.sample_drop_ratio > 0.0:
+        if self.training and self.sample_drop_ratio > 0.0:
             queries = queries + self.drop_path1(
                 attn_residual_func(queries, seg_tokens, attn_mask=attn_mask)
             )

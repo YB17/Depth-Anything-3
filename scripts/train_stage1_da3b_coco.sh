@@ -23,6 +23,7 @@ torchrun --standalone --nproc_per_node=8 \
   --trainer.precision 16-mixed \
   --model.lr 0.0004 \
   --model.num_masked_layers 4 \
-  --model.attn_mask_annealing_enabled true \
+  --model.attn_mask_annealing_enabled false \
   --model.da3_pretrained_path=/cache/model/da3/ \
+#  --resume_from_weights /cache/model/stage1_da3b_coco640/last.ckpt
 

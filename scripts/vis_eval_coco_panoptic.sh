@@ -4,9 +4,9 @@
 set -euo pipefail
 
 # Update these paths before running
-CKPT_PATH="/cache/model/stage1_da3b_coco640/last.ckpt"
+CKPT_PATH="/home/jovyan/ybai_ws/Depth-Anything-3/checkpoints/stage1_da3b_coco640/epoch=epoch=19-step=step=29520-loss=train_loss=26.6661.ckpt"
 CONFIG_PATH="/home/jovyan/ybai_ws/Depth-Anything-3/configs/seg/stage1_da3b_coco640.yaml"
-SAVE_DIR="outputs/panoptic_vis"
+SAVE_DIR="outputs/panoptic_vis2"
 DEVICE="cuda:0"
 NUM_SAMPLES=16
 

@@ -1,5 +1,7 @@
 # Optional checkpoint path for resuming training
-ckpt_path: null
+# ckpt_path: /cache/model/stage1_da3b_coco640/last.ckpt
+# load_weights_only: true
+# resume_from_weights: /cache/model/stage1_da3b_coco640/last.ckpt
 
 trainer:
   logger:
@@ -11,7 +13,7 @@ trainer:
   accelerator: gpu
   strategy: ddp_find_unused_parameters_true
   precision: 16-mixed
-  max_epochs: 20
+  max_epochs: 5
   # 🔧 添加callbacks配置
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -43,7 +45,7 @@ model:
       cat_token: true
       seg_cfg:
         enable: true
-        num_bottleneck_tokens: 16
+        num_bottleneck_tokens: 32
         num_queries: 100
         num_masked_layers: 4
         layer_start: 6
@@ -57,12 +59,12 @@ model:
   img_size: [518, 518]
   num_classes: 133
   stuff_classes: []
-  attn_mask_annealing_enabled: true
+  attn_mask_annealing_enabled: false
   num_masked_layers: 4
   lr:          0.0004      # 从 2e-4 提到 4e-4
   llrd:        0.8         # 保持不变
   weight_decay: 0.04       # 保持不变
-  warmup_steps: [1000, 2000]
+  warmup_steps: [500, 1000]
   poly_power:  0.9         # 保持不变
 
 data:
