@@ -62,6 +62,11 @@ class DA3SegPanopticModule(pl.LightningModule):
         overlap_thresh: float = 0.8,
     ) -> None:
         super().__init__()
+        # # 保存参数为实例变量
+        # self.enable_dino_teacher = enable_dino_teacher
+        # self.dino_teacher_ckpt = dino_teacher_ckpt
+        # self.dino_teacher_alpha = dino_teacher_alpha
+        
         self.network = self._build_network(network_config)
         self.img_size = img_size
         self.num_classes = num_classes
@@ -80,20 +85,27 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         self.save_hyperparameters(ignore=["network"])
 
-        teacher_cfg = getattr(self.hparams, "model", None)
-        teacher_cfg = getattr(teacher_cfg, "teacher", teacher_cfg)
-        self.enable_dino_teacher = network_config.get(
-            "enable_dino_teacher", getattr(teacher_cfg, "enable_dino_teacher", False)
-        )
-        self.dino_teacher_ckpt = network_config.get(
-            "dino_teacher_ckpt", getattr(teacher_cfg, "dino_teacher_ckpt", "")
-        )
-        self.gram_layers = network_config.get(
-            "gram_layers", getattr(teacher_cfg, "gram_layers", [5, 7, 9, 11])
-        )
-        self.lambda_gram = float(
-            network_config.get("lambda_gram", getattr(teacher_cfg, "lambda_gram", 1.0))
-        )
+        self.save_hyperparameters(ignore=["network"])
+
+        # 🔧 简化 teacher 配置获取
+        # 优先从 network_config 读取，然后尝试从 hparams 读取（命令行覆盖）
+        self.enable_dino_teacher = network_config.get("enable_dino_teacher", False)
+        self.dino_teacher_ckpt = network_config.get("dino_teacher_ckpt", "")
+        self.gram_layers = network_config.get("gram_layers", [5, 7, 9, 11])
+        self.lambda_gram = float(network_config.get("lambda_gram", 1.0))
+        
+        # 🔧 如果命令行有覆盖，使用命令行的值
+        if hasattr(self.hparams, "enable_dino_teacher"):
+            self.enable_dino_teacher = self.hparams.enable_dino_teacher
+        if hasattr(self.hparams, "dino_teacher_ckpt"):
+            self.dino_teacher_ckpt = self.hparams.dino_teacher_ckpt
+        if hasattr(self.hparams, "gram_layers"):
+            self.gram_layers = self.hparams.gram_layers
+        if hasattr(self.hparams, "lambda_gram"):
+            self.lambda_gram = self.hparams.lambda_gram
+
+        raw_ckpt_path = getattr(self.hparams, "da3_pretrained_path", "")
+        # ... rest of code ...
 
         raw_ckpt_path = getattr(self.hparams, "da3_pretrained_path", "")
         if hasattr(self.hparams, "model"):
@@ -134,8 +146,6 @@ class DA3SegPanopticModule(pl.LightningModule):
             no_object_coefficient=0.1,
         )
 
-        # ✅ 在这里调用，确保所有组件都已创建
-        self._freeze_pretrained_components()
 
         self.attn_mask_annealing_start_steps: List[int] = []
         self.attn_mask_annealing_end_steps: List[int] = []
@@ -152,9 +162,13 @@ class DA3SegPanopticModule(pl.LightningModule):
             self.dino_teacher = None
             self.gram_loss = None
 
-        self.print(
-            f"[DINOv3 teacher] enable={self.enable_dino_teacher}, gram_layers={self.gram_layers}, lambda_gram={self.lambda_gram}"
-        )
+        # self.print(
+        #     f"[DINOv3 teacher] enable={self.enable_dino_teacher}, gram_layers={self.gram_layers}, lambda_gram={self.lambda_gram}"
+        # )
+        
+        # ✅ 在这里调用，确保所有组件都已创建
+        self._freeze_pretrained_components()
+
 
         self.panoptic_evaluator: DA3CocoPanopticEvaluator | None = None
         if self.enable_panoptic_eval:
@@ -432,8 +446,13 @@ class DA3SegPanopticModule(pl.LightningModule):
         if self.enable_dino_teacher and self.gram_loss is not None:
             student_tokens = seg_tokens.get("distill_tokens", {})
             if student_tokens:
+                imgs_input = imgs
+                while imgs_input.dim() > 4:
+                    imgs_input = imgs_input.squeeze(1)  # 移除所有单维度
+                
+                # Resize 到 DINOv3 的输入尺寸
                 imgs_teacher = F.interpolate(
-                    imgs,
+                    imgs_input,
                     size=(592, 592),
                     mode="bilinear",
                     align_corners=False,
@@ -449,11 +468,11 @@ class DA3SegPanopticModule(pl.LightningModule):
                     assert (
                         z_t.shape[1] == t_l.shape[1]
                     ), f"Mismatch in tokens: student={z_t.shape[1]}, teacher={t_l.shape[1]}"
-                    b_s, t_s, c = z_t.shape
-                    h = w = int(t_s**0.5)
-                    z_t_map = z_t.view(b_s, h, w, c).permute(0, 3, 1, 2).contiguous()
-                    t_l_map = t_l.view(b_s, h, w, c).permute(0, 3, 1, 2).contiguous()
-                    loss_gram = loss_gram + self.gram_loss(z_t_map, t_l_map)
+                    # b_s, t_s, c = z_t.shape
+                    # h = w = int(t_s**0.5)
+                    # z_t_map = z_t.view(b_s, h, w, c).permute(0, 3, 1, 2).contiguous()
+                    # t_l_map = t_l.view(b_s, h, w, c).permute(0, 3, 1, 2).contiguous()
+                    loss_gram = loss_gram + self.gram_loss(z_t, t_l)
                 if len(self.gram_layers) > 0:
                     loss_gram = loss_gram / len(self.gram_layers)
                 loss_total = loss_total + self.lambda_gram * loss_gram
