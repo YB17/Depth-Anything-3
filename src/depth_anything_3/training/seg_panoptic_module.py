@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import lightning.pytorch as pl
 import torch
@@ -8,6 +8,8 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from lightning.pytorch.utilities import rank_zero_only
+import json
+import os
 
 from third_party.eomt.training.mask_classification_loss import MaskClassificationLoss
 from third_party.eomt.training.two_stage_warmup_poly_schedule import (
@@ -25,6 +27,9 @@ from depth_anything_3.utils.checkpoint_utils import (
     load_da3_pretrained_backbone,
     resolve_da3_ckpt_path,
 )
+from depth_anything_3.eval import DA3CocoPanopticEvaluator
+
+from third_party.eomt.datasets.coco_panoptic_directory import CLASS_MAPPING
 
 class DA3SegPanopticModule(pl.LightningModule):
     """Stage-1 LightningModule for DA3 + segmentation branch panoptic training."""
@@ -52,10 +57,9 @@ class DA3SegPanopticModule(pl.LightningModule):
         num_points: int = 12544,
         oversample_ratio: float = 3.0,
         importance_sample_ratio: float = 0.75,
-        # # 🔧 添加 DINO teacher 相关参数
-        # enable_dino_teacher: bool = False,
-        # dino_teacher_ckpt: str = "",
-        # dino_teacher_alpha: float = 0.5,  # 可选：teacher loss权重
+        enable_panoptic_eval: bool = True,
+        mask_thresh: float = 0.8,
+        overlap_thresh: float = 0.8,
     ) -> None:
         super().__init__()
         # # 保存参数为实例变量
@@ -67,6 +71,9 @@ class DA3SegPanopticModule(pl.LightningModule):
         self.img_size = img_size
         self.num_classes = num_classes
         self.stuff_classes = stuff_classes
+        self.enable_panoptic_eval = enable_panoptic_eval
+        self.mask_thresh = mask_thresh
+        self.overlap_thresh = overlap_thresh
         self.attn_mask_annealing_enabled = attn_mask_annealing_enabled
         self.mask_annealing_poly_factor = mask_annealing_poly_factor
         self.lr = lr
@@ -163,6 +170,28 @@ class DA3SegPanopticModule(pl.LightningModule):
         self._freeze_pretrained_components()
 
 
+        self.panoptic_evaluator: DA3CocoPanopticEvaluator | None = None
+        if self.enable_panoptic_eval:
+            try:
+                _, thing_ids, stuff_ids = self._build_coco_categories()
+            except FileNotFoundError:
+                thing_ids, stuff_ids = [], []
+            gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
+            data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
+            gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
+            if gt_json and not os.path.isabs(gt_json):
+                gt_json = os.path.join(data_root, gt_json)
+            gt_folder = os.path.join(os.path.dirname(os.path.dirname(gt_json)), "panoptic_val2017")
+
+            inverse_class_map = {v: k for k, v in CLASS_MAPPING.items()}
+            self.panoptic_evaluator = DA3CocoPanopticEvaluator(
+                gt_json=gt_json,
+                gt_folder=gt_folder,
+                inverse_class_map=inverse_class_map,
+                mask_thresh=self.mask_thresh,
+                overlap_thresh=self.overlap_thresh,
+            )
+
     def _freeze_pretrained_components(self):
         """冻结DA3 backbone和depth head，只训练segmentation相关组件"""
         
@@ -222,6 +251,37 @@ class DA3SegPanopticModule(pl.LightningModule):
         
         # 构建完整网络
         return DepthAnything3Net(net=net, head=head)
+
+    def _build_coco_categories(self) -> Tuple[List[dict], List[int], List[int]]:
+        gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
+        data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
+        gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
+        if gt_json and not os.path.isabs(gt_json):
+            gt_json = os.path.join(data_root, gt_json)
+
+        if not gt_json or not os.path.exists(gt_json):
+            raise FileNotFoundError(f"Cannot locate panoptic json at {gt_json}")
+
+        with open(gt_json, "r") as f:
+            data = json.load(f)
+
+        categories: List[dict] = data.get("categories", [])
+        thing_ids, stuff_ids = [], []
+        for cat in categories:
+            is_thing = bool(cat.get("isthing", cat.get("isthing", cat.get("isthing", 0))))
+            if not is_thing and cat.get("id", 0) < 80:
+                is_thing = True
+
+            if is_thing:
+                thing_ids.append(cat["id"])
+            else:
+                stuff_ids.append(cat["id"])
+
+        if not thing_ids and not stuff_ids:
+            thing_ids = [cid for cid in CLASS_MAPPING if cid < 80]
+            stuff_ids = [cid for cid in CLASS_MAPPING if cid >= 80]
+
+        return categories, thing_ids, stuff_ids
 
     def _compute_annealing_schedule(self, total_steps: int) -> None:
         if not self.attn_mask_annealing_enabled or self.num_masked_layers == 0:
@@ -452,10 +512,21 @@ class DA3SegPanopticModule(pl.LightningModule):
                 losses_all_blocks[f"{key}_b{i}"] = value
 
         total_loss = self.criterion.loss_total(
-            losses_all_blocks, 
+            losses_all_blocks,
             self._create_log_wrapper("val")  # ← 使用val前缀
         )
         self.log("val_loss", total_loss, prog_bar=True, sync_dist=True)
+
+        if self.panoptic_evaluator is not None and head_outputs:
+            with torch.no_grad():
+                preds = head_outputs[-1]
+                self.panoptic_evaluator.process_batch(
+                    model=self,
+                    targets=targets,
+                    mask_logits=preds["pred_masks"],
+                    class_logits=preds["pred_logits"],
+                    stuff_classes=self.stuff_classes,
+                )
 
         return total_loss
 
@@ -498,4 +569,19 @@ class DA3SegPanopticModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1,},
         }
+
+    def on_validation_epoch_end(self) -> None:
+        if self.panoptic_evaluator is None:
+            return
+
+        pq_scores = self.panoptic_evaluator.compute(global_rank=self.trainer.global_rank)
+        if pq_scores is None:
+            return
+
+        pq_all, pq_things, pq_stuff = pq_scores
+        self.log("val_PQ", pq_all, prog_bar=True, sync_dist=False)
+        self.log("val_PQ_things", pq_things, sync_dist=False)
+        self.log("val_PQ_stuff", pq_stuff, sync_dist=False)
+
+        self.panoptic_evaluator.reset()
 
