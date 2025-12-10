@@ -1,0 +1,58 @@
+trainer:
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: da3_seg_coco
+      name: stage1_da3b_coco640_lowdim
+  devices: 8
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true
+  precision: 16-mixed
+  max_epochs: 1
+
+model:
+  seg_adapter:
+    enable_lowdim: true
+    dim: 256
+    shared_layers: true
+  da3_pretrained_path: "/cache/jovyan_cache/model/da3-base/"
+  network_config:
+    net:
+      name: vitb
+      out_layers: [5, 7, 9, 11]
+      alt_start: 4
+      qknorm_start: 4
+      rope_start: 4
+      cat_token: true
+      seg_cfg:
+        enable: true
+        num_bottleneck_tokens: 16
+        num_queries: 100
+        num_masked_layers: 4
+        layer_start: 6
+        dropout: 0.0
+        attn_dropout: 0.0
+    head:
+      dim_in: 1536
+      output_dim: 2
+      features: 128
+      out_channels: [96, 192, 384, 768]
+  img_size: [518, 518]
+  num_classes: 133
+  stuff_classes: []
+  attn_mask_annealing_enabled: true
+  num_masked_layers: 4
+  lr:          0.0005
+  llrd:        0.8
+  weight_decay: 0.05
+  warmup_steps: [1500, 3000]
+  poly_power:  0.9
+
+data:
+  root: /home/jovyan/ybai_ws/dataset/dataset/coco
+  panoptic_json_train: /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_train2017.json
+  panoptic_json_val: /home/jovyan/ybai_ws/dataset/dataset/coco/panoptic_val2017.json
+  stuff_classes: []
+  batch_size_per_gpu: 10
+  num_workers: 8
+  img_size: [518, 518]

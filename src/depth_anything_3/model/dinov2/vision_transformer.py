@@ -16,7 +16,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 
 from depth_anything_3.utils.logger import logger
-from depth_anything_3.model.segmentation.blocks import SegmentationLayer
+from depth_anything_3.model.segmentation.blocks import SegAdapterLayer, SegmentationLayer
 from depth_anything_3.model.segmentation.tokens import SegmentationTokens
 from depth_anything_3.model.dinov2.layers.block import drop_add_residual_stochastic_depth
 from depth_anything_3.model.dinov2.layers.drop_path import DropPath
@@ -238,16 +238,54 @@ class DinoVisionTransformer(nn.Module):
         self.seg_dropout = seg_cfg.get("dropout", 0.0)
         self.seg_attn_dropout = seg_cfg.get("attn_dropout", 0.0)
         self.num_seg_masked_layers = seg_cfg.get("num_masked_layers", 0)
+        self.seg_adapter_cfg = seg_cfg.get("adapter", {}) or {}
+        self.seg_adapter_lowdim = bool(self.seg_adapter_cfg.get("enable_lowdim", False))
+        self.seg_shared_layers = bool(self.seg_adapter_cfg.get("shared_layers", True))
+        self.seg_dim = self.seg_adapter_cfg.get("dim", embed_dim)
+        self.seg_num_heads = num_heads
         if self.enable_seg:
+            seg_embed_dim = self.seg_dim if self.seg_adapter_lowdim else embed_dim
+            if self.seg_adapter_lowdim:
+                self.seg_proj_in = nn.Linear(embed_dim, seg_embed_dim)
             self.seg_tokens = SegmentationTokens(
-                embed_dim=embed_dim,
+                embed_dim=seg_embed_dim,
                 num_bottleneck_tokens=self.num_bottleneck_tokens,
                 num_queries=self.num_seg_queries,
             )
             self.seg_blocks = nn.ModuleList()
+            shared_layer = None
+            if self.seg_adapter_lowdim and self.seg_shared_layers:
+                shared_layer = SegAdapterLayer(
+                    embed_dim=seg_embed_dim,
+                    num_heads=self.seg_num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_dropout=self.seg_attn_dropout,
+                    drop=self.seg_dropout,
+                    ln_eps=1e-6,
+                    init_values=init_values,
+                    drop_path=0.0,
+                    patch_grid=self.patch_embed.patches_resolution,
+                )
             for i in range(depth):
                 if i < self.seg_layer_start:
                     self.seg_blocks.append(nn.Identity())
+                elif self.seg_adapter_lowdim:
+                    if self.seg_shared_layers:
+                        self.seg_blocks.append(shared_layer)
+                    else:
+                        self.seg_blocks.append(
+                            SegAdapterLayer(
+                                embed_dim=seg_embed_dim,
+                                num_heads=self.seg_num_heads,
+                                mlp_ratio=mlp_ratio,
+                                attn_dropout=self.seg_attn_dropout,
+                                drop=self.seg_dropout,
+                                ln_eps=1e-6,
+                                init_values=init_values,
+                                drop_path=0.0,
+                                patch_grid=self.patch_embed.patches_resolution,
+                            )
+                        )
                 else:
                     self.seg_blocks.append(
                         SegmentationLayer(
@@ -366,6 +404,8 @@ class DinoVisionTransformer(nn.Module):
         seg_layer_outputs = []
         if self.enable_seg:
             seg_geom = rearrange(x, "b s n c -> (b s) n c")
+            if self.seg_adapter_lowdim:
+                seg_geom = self.seg_proj_in(seg_geom)
             B_tokens, G_seg, S_tokens = self.seg_tokens(seg_geom)
             seg_output = {"B": B_tokens, "G_seg": G_seg, "S": S_tokens}
             prev_mask_logits = None
@@ -414,6 +454,8 @@ class DinoVisionTransformer(nn.Module):
             if self.enable_seg and i >= self.seg_layer_start:
                 seg_idx = i - self.seg_layer_start
                 geom_for_seg = rearrange(local_x, "b s n c -> (b s) n c")
+                if self.seg_adapter_lowdim:
+                    geom_for_seg = self.seg_proj_in(geom_for_seg)
                 attn_mask = None
                 if (
                     self.training
@@ -421,15 +463,29 @@ class DinoVisionTransformer(nn.Module):
                     and prev_mask_logits is not None
                     and seg_idx > 0
                 ):
-                    attn_mask = seg_attn_mask_fn(prev_mask_logits, seg_idx, self.seg_blocks[i].s_block.num_heads)
-                B_tokens, G_seg, S_tokens = self.seg_blocks[i](
-                    geom_for_seg,
-                    B_tokens,
-                    G_seg,
-                    S_tokens,
-                    attn_mask=attn_mask,
-                    patch_grid=self.patch_embed.patches_resolution,
-                )
+                    num_heads = (
+                        self.seg_num_heads
+                        if self.seg_adapter_lowdim
+                        else self.seg_blocks[i].s_block.num_heads
+                    )
+                    attn_mask = seg_attn_mask_fn(prev_mask_logits, seg_idx, num_heads)
+                if self.seg_adapter_lowdim:
+                    attn_masks = {"s": attn_mask} if attn_mask is not None else None
+                    G_seg, B_tokens, S_tokens = self.seg_blocks[i](
+                        geom_tokens_seg=geom_for_seg,
+                        bottleneck_tokens=B_tokens,
+                        query_tokens=S_tokens,
+                        attn_masks=attn_masks,
+                    )
+                else:
+                    B_tokens, G_seg, S_tokens = self.seg_blocks[i](
+                        geom_for_seg,
+                        B_tokens,
+                        G_seg,
+                        S_tokens,
+                        attn_mask=attn_mask,
+                        patch_grid=self.patch_embed.patches_resolution,
+                    )
 
                 head_outputs = None
                 should_run_head = False

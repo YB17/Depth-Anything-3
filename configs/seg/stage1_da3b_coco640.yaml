@@ -34,7 +34,12 @@ trainer:
         max_depth: 3
 
 model:
+  seg_adapter:
+    enable_lowdim: false
+    dim: 256
+    shared_layers: true
   da3_pretrained_path: "/cache/model/da3/"
+
   network_config:
     net:
       name: vitb

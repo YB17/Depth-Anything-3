@@ -33,6 +33,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         num_classes: int,
         stuff_classes: list[int],
         da3_pretrained_path: str = "",
+        seg_adapter: dict | None = None,
         attn_mask_annealing_enabled: bool = True,
         num_masked_layers: int | None = None,
         mask_annealing_poly_factor: float = 0.9,
@@ -51,7 +52,8 @@ class DA3SegPanopticModule(pl.LightningModule):
         importance_sample_ratio: float = 0.75,
     ) -> None:
         super().__init__()
-        self.network = self._build_network(network_config)
+        seg_adapter = seg_adapter or {}
+        self.network = self._build_network(network_config, seg_adapter)
         self.img_size = img_size
         self.num_classes = num_classes
         self.stuff_classes = stuff_classes
@@ -84,15 +86,30 @@ class DA3SegPanopticModule(pl.LightningModule):
             self.num_masked_layers = getattr(self.network.backbone, "num_seg_masked_layers", 0)
 
         embed_dim = getattr(self.network.backbone, "embed_dim", None)
+        self.backbone_dim = embed_dim
+        self.seg_adapter_cfg = getattr(self.hparams.model, "seg_adapter", seg_adapter) or {}
+        self.seg_adapter_lowdim_enabled = bool(self.seg_adapter_cfg.get("enable_lowdim", False))
+        self.seg_dim = self.seg_adapter_cfg.get("dim", embed_dim)
         patch_grid = None
         if hasattr(self.network.backbone, "patch_embed"):
             patch_grid = getattr(self.network.backbone.patch_embed, "patches_resolution", None)
         self.seg_head = EoMTSegHead(
-            embed_dim=embed_dim,
+            embed_dim=self.seg_dim if self.seg_adapter_lowdim_enabled else embed_dim,
             num_queries=num_queries,
             num_classes=num_classes,
             patch_grid=patch_grid or (img_size[0] // 16, img_size[1] // 16),
         )
+
+        from lightning.pytorch.utilities import rank_zero_info
+
+        if self.seg_adapter_lowdim_enabled:
+            rank_zero_info(
+                "[SegAdapter] lowdim enabled: seg_dim=%s, shared_layers=%s",
+                self.seg_dim,
+                self.seg_adapter_cfg.get("shared_layers", True),
+            )
+        else:
+            rank_zero_info("[SegAdapter] lowdim disabled (using full-dim per-layer blocks)")
 
         self.criterion = MaskClassificationLoss(
             num_points=num_points,
@@ -145,10 +162,14 @@ class DA3SegPanopticModule(pl.LightningModule):
         rank_zero_info(f"🔥 Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
         rank_zero_info(f"📊 Total parameters: {total_params:,}")
 
-    def _build_network(self, config: dict) -> nn.Module:
+    def _build_network(self, config: dict, seg_adapter: dict) -> nn.Module:
         """从配置字典构建网络"""
         # 构建backbone (net)
         net_config = config.get('net', {})
+        seg_cfg = net_config.get('seg_cfg')
+        if seg_cfg is not None:
+            seg_cfg = dict(seg_cfg)
+            seg_cfg['adapter'] = seg_adapter
         net = DinoV2(
             name=net_config.get('name', 'vitb'),
             out_layers=net_config.get('out_layers', [5, 7, 9, 11]),
@@ -156,7 +177,7 @@ class DA3SegPanopticModule(pl.LightningModule):
             qknorm_start=net_config.get('qknorm_start', 4),
             rope_start=net_config.get('rope_start', 4),
             cat_token=net_config.get('cat_token', True),
-            seg_cfg=net_config.get('seg_cfg'),
+            seg_cfg=seg_cfg,
         )
         
         # 构建head
