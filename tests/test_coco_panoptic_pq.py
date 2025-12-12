@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+
 import pytest
 import torch
 from PIL import Image
@@ -13,6 +14,7 @@ from depth_anything_3.eval.coco_panoptic_evaluator import (
     DA3CocoPanopticEvaluator,
     _build_segments_info,
 )
+
 
 # #region agent log
 import json as _json_log
@@ -94,6 +96,7 @@ def test_process_batch_coverage(tmp_path: Path):
     """测试 process_batch 方法，模拟 validation_step 的流程"""
     _log("test_process_batch_coverage:start", "Test started", {}, "C")
     
+
     gt_folder = tmp_path / "panoptic_val2017"
     gt_folder.mkdir()
     gt_json = tmp_path / "panoptic_val2017.json"
@@ -187,3 +190,4 @@ def test_process_batch_coverage(tmp_path: Path):
     
     for score in (pq_all, pq_things, pq_stuff):
         assert score == 1.0
+

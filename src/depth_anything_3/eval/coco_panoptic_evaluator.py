@@ -198,6 +198,19 @@ class DA3CocoPanopticEvaluator:
             open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:compute:gt_comparison", "message": "GT vs Predictions comparison", "data": {"gt_count": len(gt_ids), "pred_count": len(predicted_ids), "missing_count": len(missing_ids), "first_50_missing": missing_ids[:50], "extra_pred_ids": sorted(set(predicted_ids) - set(gt_ids))[:20]}, "hypothesisId": "F,H,I", "timestamp": __import__("time").time()}) + "\n")
             # #endregion
 
+        # 过滤掉缺失预测的图像，仅对可用的预测与对应 GT 计算 PQ
+        if missing_ids:
+            gt_data["images"] = [img for img in gt_data.get("images", []) if img["id"] in predicted_ids]
+            gt_data["annotations"] = [
+                ann for ann in gt_data.get("annotations", []) if ann.get("image_id") in predicted_ids
+            ]
+            filtered_gt_json = self._tmpdir / "filtered_gt.json"
+            with filtered_gt_json.open("w") as f:
+                json.dump(gt_data, f)
+            gt_json_for_eval = filtered_gt_json
+        else:
+            gt_json_for_eval = self.gt_json
+
         with self.pred_json.open("w") as f:
             json.dump(
                 {
@@ -219,7 +232,7 @@ class DA3CocoPanopticEvaluator:
 
         try:
             pq_res = pq_compute(
-                gt_json_file=str(self.gt_json),
+                gt_json_file=str(gt_json_for_eval),
                 pred_json_file=str(self.pred_json),
                 gt_folder=str(self.gt_folder),
                 pred_folder=str(self.pred_dir),
