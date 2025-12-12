@@ -148,6 +148,26 @@ da3 auto assets/examples/SOH \
     --export-dir ${GALLERY_DIR}/TEST_CLI/SOH \
     --model-dir ${MODEL_DIR}
 
+### 🧪 Running tests
+
+Install the development dependencies (including `pytest` and `panopticapi`) and run the panoptic PQ test directly:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/test_coco_panoptic_pq.py
+```
+
+If you want to inspect every warning instead of the condensed summary, add a warnings filter and
+request the extended report from `pytest`:
+
+```bash
+# show full warning messages and per-test outcomes
+python -W default -m pytest -ra tests/test_coco_panoptic_pq.py
+
+# equivalent when invoking via torchrun
+torchrun --standalone --nproc_per_node=1 -W default -m pytest -ra tests/test_coco_panoptic_pq.py
+```
+
 ```
 
 ### 🧪 Training with DA3 + EoMT segmentation

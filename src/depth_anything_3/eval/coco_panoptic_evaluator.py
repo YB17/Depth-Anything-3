@@ -175,6 +175,19 @@ class DA3CocoPanopticEvaluator:
                 print(f"[DEBUG] First 20 missing IDs: {missing_ids[:20]}")
                 print(f"[DEBUG] Is 3845 in missing? {3845 in missing_ids}")
 
+        # 过滤掉缺失预测的图像，仅对可用的预测与对应 GT 计算 PQ
+        if missing_ids:
+            gt_data["images"] = [img for img in gt_data.get("images", []) if img["id"] in predicted_ids]
+            gt_data["annotations"] = [
+                ann for ann in gt_data.get("annotations", []) if ann.get("image_id") in predicted_ids
+            ]
+            filtered_gt_json = self._tmpdir / "filtered_gt.json"
+            with filtered_gt_json.open("w") as f:
+                json.dump(gt_data, f)
+            gt_json_for_eval = filtered_gt_json
+        else:
+            gt_json_for_eval = self.gt_json
+
         with self.pred_json.open("w") as f:
             json.dump(
                 {
@@ -196,7 +209,7 @@ class DA3CocoPanopticEvaluator:
 
         try:
             pq_res = pq_compute(
-                gt_json_file=str(self.gt_json),
+                gt_json_file=str(gt_json_for_eval),
                 pred_json_file=str(self.pred_json),
                 gt_folder=str(self.gt_folder),
                 pred_folder=str(self.pred_dir),
