@@ -26,6 +26,10 @@ def _build_segments_info(
     segment_map = panoptic_pred[..., 1].long()
     segments_info: List[dict] = []
 
+    # #region agent log
+    import json as _json_log; open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:_build_segments_info:entry", "message": "Build segments info called", "data": {"panoptic_shape": list(panoptic_pred.shape), "unique_segments": int(segment_map.unique().numel()), "inverse_map_size": len(inverse_class_map)}, "hypothesisId": "B", "timestamp": __import__("time").time()}) + "\n")
+    # #endregion
+
     for segment_id in segment_map.unique():
         seg_id = int(segment_id.item())
         if seg_id < 0:
@@ -44,6 +48,10 @@ def _build_segments_info(
                 "isthing": int(category_id < 80),
             }
         )
+
+    # #region agent log
+    open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:_build_segments_info:exit", "message": "Build segments info result", "data": {"num_segments": len(segments_info), "segment_ids": [s["id"] for s in segments_info], "category_ids": [s["category_id"] for s in segments_info]}, "hypothesisId": "B", "timestamp": __import__("time").time()}) + "\n")
+    # #endregion
 
     return segment_map, segments_info
 
@@ -112,6 +120,9 @@ class DA3CocoPanopticEvaluator:
         class_logits: torch.Tensor,
         stuff_classes: Sequence[int],
     ) -> None:
+        # #region agent log
+        import json as _json_log; open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:process_batch:entry", "message": "process_batch called", "data": {"mask_logits_shape": list(mask_logits.shape), "class_logits_shape": list(class_logits.shape), "num_targets": len(list(targets)) if hasattr(targets, '__len__') else "unknown"}, "hypothesisId": "A,D", "timestamp": __import__("time").time()}) + "\n")
+        # #endregion
         for i, target in enumerate(targets):
             orig_size = target.get("orig_size", mask_logits.shape[-2:])
             if isinstance(orig_size, torch.Tensor):
@@ -128,12 +139,19 @@ class DA3CocoPanopticEvaluator:
                 mask_thresh=self.mask_thresh,
                 overlap_thresh=self.overlap_thresh,
             )
+            # #region agent log
+            open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:process_batch:after_panoptic", "message": "panoptic_from_logits result", "data": {"panoptic_pred_shape": list(panoptic_pred.shape), "image_id": int(target.get("image_id", i))}, "hypothesisId": "A", "timestamp": __import__("time").time()}) + "\n")
+            # #endregion
             segment_map, segments_info = _build_segments_info(
                 panoptic_pred, self.inverse_class_map
             )
             image_id = int(target.get("image_id", i))
             # 直接使用 image_id 生成标准的 COCO panoptic 格式文件名（12位补零）
             file_name = f"{image_id:012d}.png"
+
+            # #region agent log
+            open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:process_batch:prediction_added", "message": "Prediction added", "data": {"image_id": image_id, "file_name": file_name, "num_segments": len(segments_info)}, "hypothesisId": "D,E", "timestamp": __import__("time").time()}) + "\n")
+            # #endregion
 
             self._predictions.append(
                 {
@@ -174,6 +192,11 @@ class DA3CocoPanopticEvaluator:
                 print(f"[DEBUG] Missing {len(missing_ids)} predictions")
                 print(f"[DEBUG] First 20 missing IDs: {missing_ids[:20]}")
                 print(f"[DEBUG] Is 3845 in missing? {3845 in missing_ids}")
+            
+            # #region agent log
+            import json as _json_log
+            open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "coco_panoptic_evaluator.py:compute:gt_comparison", "message": "GT vs Predictions comparison", "data": {"gt_count": len(gt_ids), "pred_count": len(predicted_ids), "missing_count": len(missing_ids), "first_50_missing": missing_ids[:50], "extra_pred_ids": sorted(set(predicted_ids) - set(gt_ids))[:20]}, "hypothesisId": "F,H,I", "timestamp": __import__("time").time()}) + "\n")
+            # #endregion
 
         with self.pred_json.open("w") as f:
             json.dump(

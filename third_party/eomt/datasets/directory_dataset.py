@@ -215,6 +215,17 @@ class DirectoryDataset(torch.utils.data.Dataset):
         print(f"共找到 {len(self.imgs)} 张图片用于训练")
         if len(self.imgs) < 10:
             print("训练图片样本：", self.imgs)
+        
+        # #region agent log
+        import json as _json_log
+        _total_candidates = len(list((self.img_folder_full_path).rglob(f"*{img_suffix}"))) if hasattr(self, 'img_folder_full_path') else -1
+        _loaded_ids = []
+        import re as _re
+        for _img in self.imgs[:100]:  # 只记录前100个
+            _m = _re.search(r'(\d+)', str(Path(_img).stem))
+            if _m: _loaded_ids.append(int(_m.group(1)))
+        open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "directory_dataset.py:__init__:end", "message": "Dataset loaded", "data": {"loaded_count": len(self.imgs), "total_candidates": _total_candidates, "sample_loaded_ids": sorted(_loaded_ids)[:20], "folder": str(getattr(self, 'img_folder_full_path', 'unknown'))}, "hypothesisId": "F", "timestamp": __import__("time").time()}) + "\n")
+        # #endregion
 
     def __getitem__(self, index: int):
         # 加载图像

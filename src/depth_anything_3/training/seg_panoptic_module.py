@@ -552,6 +552,11 @@ class DA3SegPanopticModule(pl.LightningModule):
             print(f"[DEBUG] validation_step called! evaluator is None: {self.panoptic_evaluator is None}")
         
         imgs, targets = batch
+        # #region agent log
+        import json as _json_log
+        _image_ids = [int(t.get("image_id", -1)) for t in targets]
+        open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "seg_panoptic_module.py:validation_step:entry", "message": "Batch received", "data": {"batch_idx": batch_idx, "batch_size": len(targets), "image_ids": _image_ids}, "hypothesisId": "F,G", "timestamp": __import__("time").time()}) + "\n")
+        # #endregion
         network_out = self(
             imgs,
             seg_attn_mask_fn=None,
@@ -590,6 +595,12 @@ class DA3SegPanopticModule(pl.LightningModule):
                     class_logits=preds["pred_logits"],
                     stuff_classes=self.stuff_classes,
                 )
+        else:
+            # #region agent log
+            import json as _json_log
+            _skip_reason = "evaluator_none" if self.panoptic_evaluator is None else "head_outputs_empty"
+            open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "seg_panoptic_module.py:validation_step:skipped", "message": "process_batch skipped", "data": {"batch_idx": batch_idx, "skip_reason": _skip_reason, "head_outputs_len": len(head_outputs) if head_outputs else 0}, "hypothesisId": "G,J", "timestamp": __import__("time").time()}) + "\n")
+            # #endregion
 
         return total_loss
 
@@ -636,6 +647,13 @@ class DA3SegPanopticModule(pl.LightningModule):
     def on_validation_epoch_end(self) -> None:
         if self.panoptic_evaluator is None:
             return
+
+        # #region agent log
+        import json as _json_log
+        _pred_count = len(self.panoptic_evaluator._predictions)
+        _pred_ids = sorted(set(p['image_id'] for p in self.panoptic_evaluator._predictions))
+        open("/home/jovyan/ybai_ws/.cursor/debug.log", "a").write(_json_log.dumps({"location": "seg_panoptic_module.py:on_validation_epoch_end:before_compute", "message": "Before compute", "data": {"num_predictions": _pred_count, "num_unique_ids": len(_pred_ids), "first_10_ids": _pred_ids[:10], "last_10_ids": _pred_ids[-10:]}, "hypothesisId": "F,H", "timestamp": __import__("time").time()}) + "\n")
+        # #endregion
 
         try:
             pq_scores = self.panoptic_evaluator.compute(global_rank=self.trainer.global_rank)
