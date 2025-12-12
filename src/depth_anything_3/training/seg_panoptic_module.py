@@ -85,7 +85,6 @@ class DA3SegPanopticModule(pl.LightningModule):
 
         self.save_hyperparameters(ignore=["network"])
 
-        self.save_hyperparameters(ignore=["network"])
 
         # 🔧 简化 teacher 配置获取
         # 优先从 network_config 读取，然后尝试从 hparams 读取（命令行覆盖）
@@ -103,9 +102,6 @@ class DA3SegPanopticModule(pl.LightningModule):
             self.gram_layers = self.hparams.gram_layers
         if hasattr(self.hparams, "lambda_gram"):
             self.lambda_gram = self.hparams.lambda_gram
-
-        raw_ckpt_path = getattr(self.hparams, "da3_pretrained_path", "")
-        # ... rest of code ...
 
         raw_ckpt_path = getattr(self.hparams, "da3_pretrained_path", "")
         if hasattr(self.hparams, "model"):
@@ -162,6 +158,8 @@ class DA3SegPanopticModule(pl.LightningModule):
             self.dino_teacher = None
             self.gram_loss = None
 
+        if self.dino_teacher is not None:
+            self.dino_teacher.eval()
         # self.print(
         #     f"[DINOv3 teacher] enable={self.enable_dino_teacher}, gram_layers={self.gram_layers}, lambda_gram={self.lambda_gram}"
         # )
@@ -169,19 +167,67 @@ class DA3SegPanopticModule(pl.LightningModule):
         # ✅ 在这里调用，确保所有组件都已创建
         self._freeze_pretrained_components()
 
-
+        # ✅ 只保存标志位，不立即初始化 evaluator
         self.panoptic_evaluator: DA3CocoPanopticEvaluator | None = None
-        if self.enable_panoptic_eval:
-            try:
-                _, thing_ids, stuff_ids = self._build_coco_categories()
-            except FileNotFoundError:
-                thing_ids, stuff_ids = [], []
-            gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
-            data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
-            gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
+        # 不要在这里初始化！
+
+    def setup(self, stage: str) -> None:
+        """Lightning hook: 在训练/验证开始前调用，此时 hparams 已完全填充"""
+        # 🔧 添加调试输出
+        print(f"[DEBUG] setup() called with stage={stage}")
+        print(f"[DEBUG] enable_panoptic_eval={self.enable_panoptic_eval}")
+        print(f"[DEBUG] panoptic_evaluator is None: {self.panoptic_evaluator is None}")
+        
+        # 🔧 修复：在 fit 或 validate 时都初始化
+        if stage in ("fit", "validate") and self.enable_panoptic_eval and self.panoptic_evaluator is None:
+            print(f"[DEBUG] Starting evaluator initialization...")
+            
+            # 🔧 关键修复：从 trainer 的 datamodule 获取配置
+            gt_json = ""
+            data_root = ""
+            
+            if self.trainer and hasattr(self.trainer, "datamodule"):
+                datamodule = self.trainer.datamodule
+                # 直接从 datamodule 的初始化参数获取
+                gt_json = getattr(datamodule, "panoptic_json_val", "")
+                data_root = getattr(datamodule, "path", "") or getattr(datamodule, "root", "")
+                print(f"[DEBUG] Got from datamodule - gt_json: {gt_json}, data_root: {data_root}")
+            
+            # 如果 datamodule 没有，尝试从 hparams 获取（fallback）
+            if not gt_json:
+                gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
+                data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
+                gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
+                print(f"[DEBUG] Got from hparams - gt_json: {gt_json}, data_root: {data_root}")
+            
+            # 🔧 添加验证：如果路径为空，禁用 evaluator
+            if not gt_json:
+                print("[Warning] panoptic_json_val not configured, disabling PQ evaluation")
+                print(f"[DEBUG] hasattr(self.hparams, 'data'): {hasattr(self.hparams, 'data')}")
+                if hasattr(self.hparams, "data"):
+                    print(f"[DEBUG] self.hparams.data: {self.hparams.data}")
+                return
+            
             if gt_json and not os.path.isabs(gt_json):
                 gt_json = os.path.join(data_root, gt_json)
+            
+            # 验证文件是否存在
+            if not os.path.exists(gt_json):
+                print(f"[Error] GT JSON file not found: {gt_json}")
+                return
+            
             gt_folder = os.path.join(os.path.dirname(os.path.dirname(gt_json)), "panoptic_val2017")
+            
+            # 验证文件夹是否存在
+            if not os.path.exists(gt_folder):
+                print(f"[Error] GT folder not found: {gt_folder}")
+                return
+            
+            try:
+                _, thing_ids, stuff_ids = self._build_coco_categories(gt_json)  # 传入 gt_json
+            except FileNotFoundError as e:
+                print(f"[Warning] Failed to build categories: {e}")
+                thing_ids, stuff_ids = [], []
 
             inverse_class_map = {v: k for k, v in CLASS_MAPPING.items()}
             self.panoptic_evaluator = DA3CocoPanopticEvaluator(
@@ -191,6 +237,11 @@ class DA3SegPanopticModule(pl.LightningModule):
                 mask_thresh=self.mask_thresh,
                 overlap_thresh=self.overlap_thresh,
             )
+            # 🔧 添加确认日志
+            from lightning.pytorch.utilities import rank_zero_info
+            rank_zero_info(f"✅ [PQ Evaluator] Initialized successfully")
+            rank_zero_info(f"   GT JSON: {gt_json}")
+            rank_zero_info(f"   GT Folder: {gt_folder}")
 
     def _freeze_pretrained_components(self):
         """冻结DA3 backbone和depth head，只训练segmentation相关组件"""
@@ -252,12 +303,20 @@ class DA3SegPanopticModule(pl.LightningModule):
         # 构建完整网络
         return DepthAnything3Net(net=net, head=head)
 
-    def _build_coco_categories(self) -> Tuple[List[dict], List[int], List[int]]:
-        gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
-        data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
-        gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
-        if gt_json and not os.path.isabs(gt_json):
-            gt_json = os.path.join(data_root, gt_json)
+    def _build_coco_categories(self, gt_json: str = "") -> Tuple[List[dict], List[int], List[int]]:
+        """
+        从 COCO panoptic JSON 文件中提取 categories, thing_ids, stuff_ids
+        
+        Args:
+            gt_json: panoptic JSON 文件的路径。如果不提供，会尝试从 hparams 获取。
+        """
+        # 如果没有传入 gt_json，尝试从 hparams 获取（fallback）
+        if not gt_json:
+            gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
+            data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
+            gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
+            if gt_json and not os.path.isabs(gt_json):
+                gt_json = os.path.join(data_root, gt_json)
 
         if not gt_json or not os.path.exists(gt_json):
             raise FileNotFoundError(f"Cannot locate panoptic json at {gt_json}")
@@ -443,7 +502,7 @@ class DA3SegPanopticModule(pl.LightningModule):
         loss_total = loss_seg
         loss_gram = torch.tensor(0.0, device=loss_seg.device)
 
-        if self.enable_dino_teacher and self.gram_loss is not None:
+        if self.enable_dino_teacher and self.gram_loss is not None and self.current_epoch < 2:
             student_tokens = seg_tokens.get("distill_tokens", {})
             if student_tokens:
                 imgs_input = imgs
@@ -488,6 +547,10 @@ class DA3SegPanopticModule(pl.LightningModule):
         return loss_total
 
     def validation_step(self, batch: Any, batch_idx: int):
+        # 🔧 添加调试输出
+        if batch_idx == 0:
+            print(f"[DEBUG] validation_step called! evaluator is None: {self.panoptic_evaluator is None}")
+        
         imgs, targets = batch
         network_out = self(
             imgs,
@@ -574,14 +637,21 @@ class DA3SegPanopticModule(pl.LightningModule):
         if self.panoptic_evaluator is None:
             return
 
-        pq_scores = self.panoptic_evaluator.compute(global_rank=self.trainer.global_rank)
-        if pq_scores is None:
-            return
+        try:
+            pq_scores = self.panoptic_evaluator.compute(global_rank=self.trainer.global_rank)
+            if pq_scores is None:
+                return
 
-        pq_all, pq_things, pq_stuff = pq_scores
-        self.log("val_PQ", pq_all, prog_bar=True, sync_dist=False)
-        self.log("val_PQ_things", pq_things, sync_dist=False)
-        self.log("val_PQ_stuff", pq_stuff, sync_dist=False)
-
-        self.panoptic_evaluator.reset()
+            pq_all, pq_things, pq_stuff = pq_scores
+            self.log("val_PQ", pq_all, prog_bar=True, sync_dist=False, on_step=False, on_epoch=True)
+            self.log("val_PQ_things", pq_things, sync_dist=False, on_step=False, on_epoch=True)
+            self.log("val_PQ_stuff", pq_stuff, sync_dist=False, on_step=False, on_epoch=True)
+            
+            from lightning.pytorch.utilities import rank_zero_info
+            rank_zero_info(f"📊 Epoch {self.current_epoch} PQ: {pq_all:.4f} (Things: {pq_things:.4f}, Stuff: {pq_stuff:.4f})")
+        except Exception as e:
+            from lightning.pytorch.utilities import rank_zero_warn
+            rank_zero_warn(f"⚠️  PQ computation failed: {e}")
+        finally:
+            self.panoptic_evaluator.reset()
 

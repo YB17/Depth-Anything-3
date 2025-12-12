@@ -131,11 +131,9 @@ class DA3CocoPanopticEvaluator:
             segment_map, segments_info = _build_segments_info(
                 panoptic_pred, self.inverse_class_map
             )
-
             image_id = int(target.get("image_id", i))
-            file_name = str(target.get("file_name", f"{image_id}.png"))
-            if not file_name.endswith(".png"):
-                file_name = file_name.replace(".jpg", ".png")
+            # 直接使用 image_id 生成标准的 COCO panoptic 格式文件名（12位补零）
+            file_name = f"{image_id:012d}.png"
 
             self._predictions.append(
                 {
@@ -154,16 +152,41 @@ class DA3CocoPanopticEvaluator:
         if global_rank != 0:
             return None
 
+        # 🔧 添加验证：如果没有预测，返回 None
+        if not all_predictions:
+            print("[Warning] No predictions to evaluate, skipping PQ computation")
+            return None
+
+        # 🔧 添加调试信息：对比预测和 ground truth
+        print(f"[DEBUG] Total predictions collected: {len(all_predictions)}")
+        predicted_ids = sorted(set(p['image_id'] for p in all_predictions))
+        print(f"[DEBUG] Number of unique image_ids: {len(predicted_ids)}")
+        print(f"[DEBUG] First 10 predicted IDs: {predicted_ids[:10]}")
+        print(f"[DEBUG] Last 10 predicted IDs: {predicted_ids[-10:]}")
+        
+        # 检查 ground truth 有多少图像
+        with open(str(self.gt_json), 'r') as f:
+            gt_data = json.load(f)
+            gt_ids = sorted([img['id'] for img in gt_data.get('images', [])])
+            print(f"[DEBUG] Ground truth total images: {len(gt_ids)}")
+            missing_ids = sorted(set(gt_ids) - set(predicted_ids))
+            if missing_ids:
+                print(f"[DEBUG] Missing {len(missing_ids)} predictions")
+                print(f"[DEBUG] First 20 missing IDs: {missing_ids[:20]}")
+                print(f"[DEBUG] Is 3845 in missing? {3845 in missing_ids}")
+
         with self.pred_json.open("w") as f:
             json.dump(
-                [
-                    {
-                        "image_id": pred["image_id"],
-                        "file_name": pred["file_name"],
-                        "segments_info": pred["segments_info"],
-                    }
-                    for pred in all_predictions
-                ],
+                {
+                    "annotations": [
+                        {
+                            "image_id": pred["image_id"],
+                            "file_name": pred["file_name"],
+                            "segments_info": pred["segments_info"],
+                        }
+                        for pred in all_predictions
+                    ]
+                },
                 f,
             )
 
@@ -171,18 +194,39 @@ class DA3CocoPanopticEvaluator:
             out_path = self.pred_dir / pred["file_name"]
             Image.fromarray(id2rgb(pred["segment_map"].numpy())).save(out_path)
 
-        pq_res = pq_compute(
-            gt_json_file=str(self.gt_json),
-            pred_json_file=str(self.pred_json),
-            gt_folder=str(self.gt_folder),
-            pred_folder=str(self.pred_dir),
-        )
+        try:
+            pq_res = pq_compute(
+                gt_json_file=str(self.gt_json),
+                pred_json_file=str(self.pred_json),
+                gt_folder=str(self.gt_folder),
+                pred_folder=str(self.pred_dir),
+            )
 
-        return (
-            pq_res["All"]["pq"],
-            pq_res["Things"]["pq"],
-            pq_res["Stuff"]["pq"],
-        )
+            # 🔧 添加验证：检查返回结果的格式
+            if not isinstance(pq_res, dict):
+                print(f"[Warning] pq_compute returned unexpected type: {type(pq_res)}, expected dict")
+                return None
+
+            # 🔧 验证必需的键是否存在
+            if "All" not in pq_res or "Things" not in pq_res or "Stuff" not in pq_res:
+                print(f"[Warning] pq_compute result missing required keys. Available keys: {pq_res.keys()}")
+                return None
+
+            # 🔧 验证嵌套结构
+            if not isinstance(pq_res["All"], dict) or "pq" not in pq_res["All"]:
+                print(f"[Warning] pq_compute result has unexpected structure")
+                return None
+
+            return (
+                pq_res["All"]["pq"],
+                pq_res["Things"]["pq"],
+                pq_res["Stuff"]["pq"],
+            )
+        except Exception as e:
+            print(f"[Error] PQ computation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def reset(self) -> None:
         self._predictions.clear()

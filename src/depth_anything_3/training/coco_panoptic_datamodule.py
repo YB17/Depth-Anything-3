@@ -24,6 +24,11 @@ class COCOPanopticDataModule(COCOPanopticDirectory):
         scale_range: tuple[float, float] = (0.1, 2.0),
         check_empty_targets: bool = True,
     ) -> None:
+        # 🔧 关键修复：保存这些参数为实例变量
+        self.root = root
+        self.panoptic_json_train = panoptic_json_train
+        self.panoptic_json_val = panoptic_json_val
+        
         # 将参数适配到 COCOPanopticDirectory 的接口
         super().__init__(
             path=root,
