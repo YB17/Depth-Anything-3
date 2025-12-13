@@ -11,13 +11,13 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 
 
-torchrun --standalone --nproc_per_node=4 \
+torchrun --standalone --nproc_per_node=2 \
   -m depth_anything_3.training.main_seg_stage1 fit \
   --config configs/seg/stage1_da3b_coco640.yaml \
   --data.root /home/jovyan/ybai_ws/dataset/dataset/coco \
   --data.panoptic_json_train /home/jovyan/ybai_ws/dataset/dataset/coco/annotations/panoptic_train2017.json \
   --data.panoptic_json_val /home/jovyan/ybai_ws/dataset/dataset/coco/annotations/panoptic_val2017.json \
-  --trainer.devices 4 \
+  --trainer.devices 2 \
   --trainer.accelerator gpu \
   --trainer.strategy ddp_find_unused_parameters_true \
   --trainer.precision 16-mixed \

@@ -15,7 +15,7 @@ trainer:
   precision: 16-mixed
   check_val_every_n_epoch: 1
   limit_val_batches: 1.0
-  max_epochs: 1
+  max_epochs: 8
   # 🔧 添加callbacks配置
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -38,7 +38,7 @@ trainer:
 model:
   da3_pretrained_path: "/cache/model/da3/"
   network_config:
-    enable_dino_teacher: true
+    enable_dino_teacher: false
     dino_teacher_ckpt: "/cache/model/dinov3/dinov3_vitb16_pretrain.pth"
     gram_layers: [5, 6, 7, 8, 9, 10, 11]
     lambda_gram: 0.1
@@ -58,7 +58,7 @@ model:
         layer_start: 6
         dropout: 0.0
         attn_dropout: 0.0
-        enable_dino_teacher: true
+        enable_dino_teacher: false
         distill_layers: [5, 6, 7, 8, 9, 10, 11]
         dino_d_base: 384
         dino_teacher_dim: 768
@@ -71,7 +71,6 @@ model:
       out_channels: [96, 192, 384, 768]
   img_size: [518, 518]
   num_classes: 133
-  stuff_classes: []
   enable_panoptic_eval: true
   mask_thresh: 0.8
   overlap_thresh: 0.8
@@ -87,7 +86,7 @@ data:
   root: /home/jovyan/ybai_ws/dataset/dataset/coco
   panoptic_json_train: /home/jovyan/ybai_ws/dataset/dataset/coco/annotations/panoptic_train2017.json
   panoptic_json_val: /home/jovyan/ybai_ws/dataset/dataset/coco/annotations/panoptic_val2017.json
-  stuff_classes: []
   batch_size_per_gpu: 10
   num_workers: 8
   img_size: [518, 518]
+  stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]

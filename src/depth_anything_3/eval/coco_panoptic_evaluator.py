@@ -46,6 +46,16 @@ class DA3CocoPanopticEvaluator:
         mask_thresh: float = 0.8,
         overlap_thresh: float = 0.8,
     ) -> None:
+        # ✅ 添加验证
+        if not stuff_classes:
+            raise ValueError("stuff_classes cannot be empty")
+        
+        if any(cls_id < 0 or cls_id >= num_classes for cls_id in stuff_classes):
+            raise ValueError(
+                f"All stuff_classes must be in range [0, {num_classes}), "
+                f"but got: {[c for c in stuff_classes if c < 0 or c >= num_classes]}"
+            )
+
         self.num_classes = num_classes
         self.stuff_classes = list(stuff_classes)
         self.thing_classes = [
@@ -63,6 +73,43 @@ class DA3CocoPanopticEvaluator:
         )
 
         self._predictions: list[dict] = []
+
+        # ✅ 初始化日志
+        try:
+            from lightning.pytorch.utilities import rank_zero_info
+            rank_zero_info(
+                f"📊 [PQ Evaluator] Initialized: "
+                f"{len(self.thing_classes)} things, "
+                f"{len(self.stuff_classes)} stuff, "
+                f"void={self.void_class}"
+            )
+        except:
+            pass  # 不在Lightning环境中时忽略
+
+    @classmethod
+    def from_coco_standard(
+        cls,
+        num_classes: int = 133,
+        thing_classes_end: int = 80,
+        mask_thresh: float = 0.8,
+        overlap_thresh: float = 0.8,
+    ) -> "DA3CocoPanopticEvaluator":
+        """
+        使用 COCO 标准约定创建 evaluator
+        
+        Args:
+            num_classes: 总类别数（默认133）
+            thing_classes_end: thing类别结束位置（默认80）
+            mask_thresh: mask阈值
+            overlap_thresh: overlap阈值
+        """
+        stuff_classes = list(range(thing_classes_end, num_classes))
+        return cls(
+            num_classes=num_classes,
+            stuff_classes=stuff_classes,
+            mask_thresh=mask_thresh,
+            overlap_thresh=overlap_thresh,
+        )
 
     def _build_target_panoptic(
         self, target: dict, spatial_size: Tuple[int, int]
@@ -111,6 +158,11 @@ class DA3CocoPanopticEvaluator:
     ) -> None:
         metric = self.metric
 
+        # ✅ 确保 metric 在正确的设备上（修复设备不匹配问题）
+        device = panoptic_pred.device
+        if metric.iou_sum.device != device:
+            metric.to(device)
+            
         flatten_pred = _prepocess_inputs(
             metric.things,
             metric.stuffs,
@@ -143,10 +195,17 @@ class DA3CocoPanopticEvaluator:
             if pred_color not in pred_areas or target_color not in target_areas:
                 continue
 
+            # ✅ 跳过类别不匹配的情况（关键修复！）
+            if pred_color[0] != target_color[0]:
+                continue
+
             iou = _calculate_iou(
-                intersection_areas[(pred_color, target_color)],
-                pred_areas[pred_color],
-                target_areas[target_color],
+                pred_color,
+                target_color,
+                pred_areas,
+                target_areas,
+                intersection_areas,
+                metric.void_color,
             )
 
             if iou > 0.5:
@@ -244,6 +303,13 @@ class DA3CocoPanopticEvaluator:
             print("[Warning] No predictions to evaluate, skipping PQ computation")
             return None
 
+        # ✅ 添加统计日志
+        try:
+            from lightning.pytorch.utilities import rank_zero_info
+            rank_zero_info(f"📊 Computing PQ for {len(self._predictions)} images")
+        except:
+            pass
+
         tp = self.metric.true_positives.to(torch.float32)
         fp = self.metric.false_positives.to(torch.float32)
         fn = self.metric.false_negatives.to(torch.float32)
@@ -255,6 +321,15 @@ class DA3CocoPanopticEvaluator:
             dist.all_reduce(fn)
             dist.all_reduce(iou_sum)
 
+        # ✅ 添加统计信息
+        try:
+            from lightning.pytorch.utilities import rank_zero_info
+            rank_zero_info(
+                f"   Stats - TP: {tp.sum():.0f}, FP: {fp.sum():.0f}, FN: {fn.sum():.0f}"
+            )
+        except:
+            pass
+            
         den = tp + 0.5 * fp + 0.5 * fn
 
         pq = torch.zeros_like(den)
