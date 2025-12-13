@@ -8,8 +8,6 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from lightning.pytorch.utilities import rank_zero_only
-import json
-import os
 
 from third_party.eomt.training.mask_classification_loss import MaskClassificationLoss
 from third_party.eomt.training.two_stage_warmup_poly_schedule import (
@@ -28,8 +26,6 @@ from depth_anything_3.utils.checkpoint_utils import (
     resolve_da3_ckpt_path,
 )
 from depth_anything_3.eval import DA3CocoPanopticEvaluator
-
-from third_party.eomt.datasets.coco_panoptic_directory import CLASS_MAPPING
 
 class DA3SegPanopticModule(pl.LightningModule):
     """Stage-1 LightningModule for DA3 + segmentation branch panoptic training."""
@@ -177,71 +173,19 @@ class DA3SegPanopticModule(pl.LightningModule):
         print(f"[DEBUG] setup() called with stage={stage}")
         print(f"[DEBUG] enable_panoptic_eval={self.enable_panoptic_eval}")
         print(f"[DEBUG] panoptic_evaluator is None: {self.panoptic_evaluator is None}")
-        
+
         # 🔧 修复：在 fit 或 validate 时都初始化
         if stage in ("fit", "validate") and self.enable_panoptic_eval and self.panoptic_evaluator is None:
             print(f"[DEBUG] Starting evaluator initialization...")
-            
-            # 🔧 关键修复：从 trainer 的 datamodule 获取配置
-            gt_json = ""
-            data_root = ""
-            
-            if self.trainer and hasattr(self.trainer, "datamodule"):
-                datamodule = self.trainer.datamodule
-                # 直接从 datamodule 的初始化参数获取
-                gt_json = getattr(datamodule, "panoptic_json_val", "")
-                data_root = getattr(datamodule, "path", "") or getattr(datamodule, "root", "")
-                print(f"[DEBUG] Got from datamodule - gt_json: {gt_json}, data_root: {data_root}")
-            
-            # 如果 datamodule 没有，尝试从 hparams 获取（fallback）
-            if not gt_json:
-                gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
-                data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
-                gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
-                print(f"[DEBUG] Got from hparams - gt_json: {gt_json}, data_root: {data_root}")
-            
-            # 🔧 添加验证：如果路径为空，禁用 evaluator
-            if not gt_json:
-                print("[Warning] panoptic_json_val not configured, disabling PQ evaluation")
-                print(f"[DEBUG] hasattr(self.hparams, 'data'): {hasattr(self.hparams, 'data')}")
-                if hasattr(self.hparams, "data"):
-                    print(f"[DEBUG] self.hparams.data: {self.hparams.data}")
-                return
-            
-            if gt_json and not os.path.isabs(gt_json):
-                gt_json = os.path.join(data_root, gt_json)
-            
-            # 验证文件是否存在
-            if not os.path.exists(gt_json):
-                print(f"[Error] GT JSON file not found: {gt_json}")
-                return
-            
-            gt_folder = os.path.join(os.path.dirname(os.path.dirname(gt_json)), "panoptic_val2017")
-            
-            # 验证文件夹是否存在
-            if not os.path.exists(gt_folder):
-                print(f"[Error] GT folder not found: {gt_folder}")
-                return
-            
-            try:
-                _, thing_ids, stuff_ids = self._build_coco_categories(gt_json)  # 传入 gt_json
-            except FileNotFoundError as e:
-                print(f"[Warning] Failed to build categories: {e}")
-                thing_ids, stuff_ids = [], []
-
-            inverse_class_map = {v: k for k, v in CLASS_MAPPING.items()}
             self.panoptic_evaluator = DA3CocoPanopticEvaluator(
-                gt_json=gt_json,
-                gt_folder=gt_folder,
-                inverse_class_map=inverse_class_map,
+                num_classes=self.num_classes,
+                stuff_classes=self.stuff_classes,
                 mask_thresh=self.mask_thresh,
                 overlap_thresh=self.overlap_thresh,
             )
             # 🔧 添加确认日志
             from lightning.pytorch.utilities import rank_zero_info
-            rank_zero_info(f"✅ [PQ Evaluator] Initialized successfully")
-            rank_zero_info(f"   GT JSON: {gt_json}")
-            rank_zero_info(f"   GT Folder: {gt_folder}")
+            rank_zero_info("✅ [PQ Evaluator] Initialized successfully (EoMT metrics)")
 
     def _freeze_pretrained_components(self):
         """冻结DA3 backbone和depth head，只训练segmentation相关组件"""
@@ -302,45 +246,6 @@ class DA3SegPanopticModule(pl.LightningModule):
         
         # 构建完整网络
         return DepthAnything3Net(net=net, head=head)
-
-    def _build_coco_categories(self, gt_json: str = "") -> Tuple[List[dict], List[int], List[int]]:
-        """
-        从 COCO panoptic JSON 文件中提取 categories, thing_ids, stuff_ids
-        
-        Args:
-            gt_json: panoptic JSON 文件的路径。如果不提供，会尝试从 hparams 获取。
-        """
-        # 如果没有传入 gt_json，尝试从 hparams 获取（fallback）
-        if not gt_json:
-            gt_json = getattr(self.hparams.data, "panoptic_json_val", "") if hasattr(self.hparams, "data") else ""
-            data_root = getattr(self.hparams.data, "root", "") if hasattr(self.hparams, "data") else ""
-            gt_json = gt_json or getattr(self.hparams, "panoptic_json_val", "")
-            if gt_json and not os.path.isabs(gt_json):
-                gt_json = os.path.join(data_root, gt_json)
-
-        if not gt_json or not os.path.exists(gt_json):
-            raise FileNotFoundError(f"Cannot locate panoptic json at {gt_json}")
-
-        with open(gt_json, "r") as f:
-            data = json.load(f)
-
-        categories: List[dict] = data.get("categories", [])
-        thing_ids, stuff_ids = [], []
-        for cat in categories:
-            is_thing = bool(cat.get("isthing", cat.get("isthing", cat.get("isthing", 0))))
-            if not is_thing and cat.get("id", 0) < 80:
-                is_thing = True
-
-            if is_thing:
-                thing_ids.append(cat["id"])
-            else:
-                stuff_ids.append(cat["id"])
-
-        if not thing_ids and not stuff_ids:
-            thing_ids = [cid for cid in CLASS_MAPPING if cid < 80]
-            stuff_ids = [cid for cid in CLASS_MAPPING if cid >= 80]
-
-        return categories, thing_ids, stuff_ids
 
     def _compute_annealing_schedule(self, total_steps: int) -> None:
         if not self.attn_mask_annealing_enabled or self.num_masked_layers == 0:

@@ -444,7 +444,25 @@ class LightningModule(lightning.LightningModule):
 
     def _on_eval_epoch_end_panoptic(self, log_prefix, log_per_class=False):
         for i, metric in enumerate(self.metrics):  # type: ignore
-            result = metric.compute()[:-1]
+            tp = metric.true_positives.to(torch.float32)
+            fp = metric.false_positives.to(torch.float32)
+            fn = metric.false_negatives.to(torch.float32)
+            iou_sum = metric.iou_sum.to(torch.float32)
+
+            den = tp + 0.5 * fp + 0.5 * fn
+
+            pq = torch.zeros_like(den)
+            sq = torch.zeros_like(den)
+            rq = torch.zeros_like(den)
+
+            non_zero_den = den > 0
+            pq[non_zero_den] = iou_sum[non_zero_den] / den[non_zero_den]
+            rq[non_zero_den] = tp[non_zero_den] / den[non_zero_den]
+
+            tp_mask = tp > 0
+            sq[tp_mask] = iou_sum[tp_mask] / tp[tp_mask]
+
+            result = torch.stack((pq, sq, rq), dim=-1)[:-1]
             metric.reset()
 
             pq, sq, rq = result[:, 0], result[:, 1], result[:, 2]
