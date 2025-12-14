@@ -37,6 +37,26 @@ trainer:
 
 model:
   da3_pretrained_path: "/cache/model/da3/"
+  distill:
+    enable: false
+    teacher_type: dinov2
+    teacher_variant: vitb14
+    teacher_pretrained_path: ""
+    input_size: [518, 518]
+    use_teacher_normalize: true
+    loss_type: cosine
+    lambda_max: 0.05
+    feature_normalize: true
+    fp32_loss: true
+    curriculum:
+      enable: false
+      warmup_frac: 0.05
+      ramp_end_frac: 0.25
+      ramp_power: 2.0
+      tail_decay: true
+      tail_start_frac: 0.85
+      layers: [5, 7, 9, 11]
+      layer_curriculum: {}
   network_config:
     enable_dino_teacher: false
     dino_teacher_ckpt: "/cache/model/dinov3/dinov3_vitb16_pretrain.pth"
