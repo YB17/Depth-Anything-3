@@ -123,3 +123,26 @@ class MaskClassificationPanoptic(LightningModule):
 
     def on_validation_end(self):
         self._on_eval_end_panoptic("val")
+
+    def compute_panoptic_loss(
+        self,
+        mask_logits_per_block,
+        class_logits_per_block,
+        targets,
+    ):
+        losses_all_blocks = {}
+        for i, (mask_logits, class_logits) in enumerate(
+            list(zip(mask_logits_per_block, class_logits_per_block))
+        ):
+            losses = self.criterion(
+                masks_queries_logits=mask_logits,
+                class_queries_logits=class_logits,
+                targets=targets,
+            )
+            block_postfix = self.block_postfix(i)
+            losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
+            losses_all_blocks |= losses
+
+        loss_gt = self.criterion.loss_total(losses_all_blocks, self.log)
+
+        return loss_gt, losses_all_blocks

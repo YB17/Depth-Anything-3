@@ -7,6 +7,7 @@
 from typing import Optional
 import torch
 import torch.nn as nn
+import logging
 
 import timm
 from transformers import AutoModel
@@ -19,6 +20,7 @@ class ViT(nn.Module):
         patch_size=None,
         backbone_name="vit_large_patch14_reg4_dinov2",
         ckpt_path: Optional[str] = None,
+        backbone_pretrained_path: Optional[str] = None,
     ):
         super().__init__()
 
@@ -32,11 +34,14 @@ class ViT(nn.Module):
         else:
             self.backbone = timm.create_model(
                 backbone_name,
-                pretrained=ckpt_path is None,
+                pretrained=ckpt_path is None and backbone_pretrained_path is None,
                 img_size=img_size,
                 patch_size=patch_size,
                 num_classes=0,
             )
+
+        if backbone_pretrained_path is not None:
+            self._load_backbone_ckpt(backbone_pretrained_path)
 
         pixel_mean = torch.tensor([0.485, 0.456, 0.406]).reshape(1, -1, 1, 1)
         pixel_std = torch.tensor([0.229, 0.224, 0.225]).reshape(1, -1, 1, 1)
@@ -66,3 +71,29 @@ class ViT(nn.Module):
         )
 
         return backbone
+
+    def _load_backbone_ckpt(self, backbone_pretrained_path: str):
+        ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
+
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+                ckpt = ckpt["state_dict"]
+            elif "model" in ckpt and isinstance(ckpt["model"], dict):
+                ckpt = ckpt["model"]
+
+        if isinstance(ckpt, dict) and all(
+            isinstance(k, str) for k in ckpt.keys()
+        ):
+            if all(k.startswith("module.") for k in ckpt.keys()):
+                ckpt = {k.replace("module.", "", 1): v for k, v in ckpt.items()}
+
+            incompatible = self.backbone.load_state_dict(ckpt, strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                logging.info(
+                    f"Backbone checkpoint loaded with missing keys {incompatible.missing_keys} "
+                    f"and unexpected keys {incompatible.unexpected_keys}"
+                )
+        else:
+            raise ValueError(
+                "Backbone checkpoint should be a state_dict or contain a 'state_dict'/'model' field."
+            )

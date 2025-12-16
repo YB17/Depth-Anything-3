@@ -220,10 +220,10 @@ class LightningModule(lightning.LightningModule):
             },
         }
 
-    def forward(self, imgs):
+    def forward(self, imgs, **kwargs):
         x = imgs / 255.0
 
-        return self.network(x)
+        return self.network(x, **kwargs)
 
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
