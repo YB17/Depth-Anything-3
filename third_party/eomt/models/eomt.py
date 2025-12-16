@@ -147,8 +147,16 @@ class EoMT(nn.Module):
         )
         return attn_mask
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_backbone_feats: bool = False,
+        return_seg_layers: bool = False,
+    ):
         x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
+
+        backbone_feats = []
+        seg_layers = []
 
         rope = None
         if hasattr(self.encoder.backbone, "rope_embeddings"):
@@ -168,13 +176,29 @@ class EoMT(nn.Module):
                     (self.q.weight[None, :, :].expand(x.shape[0], -1, -1), x), dim=1
                 )
 
+            need_norm = return_backbone_feats or (
+                self.masked_attn_enabled
+                and i >= len(self.encoder.backbone.blocks) - self.num_blocks
+            )
+            normed_x = self.encoder.backbone.norm(x) if need_norm else None
+
+            if return_backbone_feats and normed_x is not None:
+                backbone_feats.append(normed_x)
+
             if (
                 self.masked_attn_enabled
                 and i >= len(self.encoder.backbone.blocks) - self.num_blocks
             ):
-                mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+                if normed_x is None:
+                    normed_x = self.encoder.backbone.norm(x)
+                mask_logits, class_logits = self._predict(normed_x)
                 mask_logits_per_layer.append(mask_logits)
                 class_logits_per_layer.append(class_logits)
+
+                if return_seg_layers:
+                    seg_layers.append(
+                        {"pred_masks": mask_logits, "pred_logits": class_logits}
+                    )
 
                 attn_mask = self._attn_mask(x, mask_logits, i)
 
@@ -194,11 +218,29 @@ class EoMT(nn.Module):
             elif hasattr(block, "layer_scale2"):
                 x = x + block.layer_scale2(mlp_out)
 
-        mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+        final_normed_x = self.encoder.backbone.norm(x)
+
+        if return_backbone_feats:
+            backbone_feats.append(final_normed_x)
+
+        mask_logits, class_logits = self._predict(final_normed_x)
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
 
-        return (
+        if return_seg_layers:
+            seg_layers.append({"pred_masks": mask_logits, "pred_logits": class_logits})
+
+        outputs = (
             mask_logits_per_layer,
             class_logits_per_layer,
         )
+
+        if return_backbone_feats or return_seg_layers:
+            result = {"panoptic": outputs}
+            if return_backbone_feats:
+                result["backbone_feats"] = backbone_feats
+            if return_seg_layers:
+                result["seg_layers"] = seg_layers
+            return result
+
+        return outputs

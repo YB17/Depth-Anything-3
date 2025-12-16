@@ -124,6 +124,23 @@ To fine-tune a pre-trained EoMT model, add:
 
 > **DINOv3 Models**: When using DINOv3-based configurations, the code expects delta weights relative to DINOv3 weights by default. To disable this behavior and use absolute weights instead, add `--model.delta_weights False`. 
 
+### Distillation (DINOv2 Teacher → DA3 Student)
+
+To run panoptic distillation with a DINOv2 EoMT teacher and a DA3-pretrained student backbone, use the dedicated distillation config:
+
+```bash
+python3 main.py fit \
+  -c configs/distill/eomt_da3_coco_panoptic.yaml \
+  --trainer.devices 8 \
+  --data.batch_size 2 \
+  --data.path /path/to/dataset \
+  --model.init_args.distill.teacher_ckpt_path /path/to/eomt_dinov2_teacher.ckpt \
+  --model.init_args.distill.student_pretrained_path /path/to/da3_backbone_pretrain.pth \
+  --model.init_args.network.init_args.encoder.init_args.backbone_pretrained_path /path/to/da3_backbone_pretrain.pth
+```
+
+🔧 Replace the paths with your teacher checkpoint, DA3 backbone weights, and dataset location. The command keeps the original validation logic while adding feature- and logit-level distillation on top of the panoptic loss.
+
 ### Evaluating
 
 To evaluate a pre-trained EoMT model, run:
