@@ -16,7 +16,7 @@ class ViT(nn.Module):
     def __init__(
         self,
         img_size: tuple[int, int],
-        patch_size=16,
+        patch_size=None,
         backbone_name="vit_large_patch14_reg4_dinov2",
         ckpt_path: Optional[str] = None,
     ):

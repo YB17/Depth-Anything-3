@@ -1,5 +1,7 @@
 trainer:
-  max_epochs: 12
+  max_epochs: 30
+  devices: 4
+  strategy: ddp_find_unused_parameters_true
   logger:
     class_path: lightning.pytorch.loggers.wandb.WandbLogger
     init_args:
@@ -9,7 +11,11 @@ trainer:
 model:
   class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
   init_args:
+    # ckpt_path: /cache/model/da3/model.safetensors
+    load_ckpt_class_head: False  # DA3 没有 EoMT 的 class head
+    da3_key_mapping: True
     attn_mask_annealing_enabled: True
+    # ckpt_path: /cache/model/dinov2/dinov2_vitb14_reg4_pretrain.pth
     attn_mask_annealing_start_steps: [14782, 36955, 59128]
     attn_mask_annealing_end_steps: [29564, 51737, 73910]
     network:
@@ -21,7 +27,12 @@ model:
           class_path: models.vit.ViT
           init_args:
             backbone_name: vit_base_patch14_reg4_dinov2
+            ckpt_path: /cache/model/dinov2/dinov2_vitb14_reg4_pretrain.pth 
 data:
-  class_path: datasets.coco_panoptic.COCOPanoptic
+  class_path: datasets.coco_panoptic_directory.COCOPanopticDirectory
   init_args:
+    path: /home/jovyan/ybai_ws/dataset/dataset/coco
+    batch_size: 10
+    num_workers: 8
+    img_size: [518, 518]
     stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]

@@ -133,6 +133,8 @@ def build_lightning_module(cfg: Dict[str, Any]) -> DA3EoMTTSLoRALightning:
     ckpt_path = resolve_da3_ckpt_path(model_cfg.get("da3_pretrained_path", "") or "")
     if ckpt_path and hasattr(network, "backbone"):
         load_da3_pretrained_backbone(network.backbone, ckpt_path, strict=False)
+    else:
+        print("😂😂😂ckpt_path is None or backbone is not found!😂😂😂")
 
     lightning_kwargs = dict(
         network=network,

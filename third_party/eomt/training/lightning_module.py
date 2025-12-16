@@ -35,6 +35,7 @@ from torchvision.transforms.v2.functional import pad
 import logging
 
 from .two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
+from safetensors.torch import load_file as load_safetensors
 
 bold_green = "\033[1;32m"
 reset = "\033[0m"
@@ -59,6 +60,7 @@ class LightningModule(lightning.LightningModule):
         ckpt_path=None,
         delta_weights=False,
         load_ckpt_class_head=True,
+        da3_key_mapping=False,
     ):
         super().__init__()
 
@@ -78,26 +80,76 @@ class LightningModule(lightning.LightningModule):
 
         self.strict_loading = False
 
-        if delta_weights and ckpt_path:
-            logging.info("Delta weights mode")
-            self._zero_init_outside_encoder(skip_class_head=not load_ckpt_class_head)
-            current_state_dict = {k: v.cpu() for k, v in self.state_dict().items()}
-            if not load_ckpt_class_head:
-                current_state_dict = {
-                    k: v
-                    for k, v in current_state_dict.items()
-                    if "class_head" not in k and "class_predictor" not in k
-                }
-            ckpt = self._load_ckpt(ckpt_path, load_ckpt_class_head)
-            combined_state_dict = self._add_state_dicts(current_state_dict, ckpt)
-            incompatible_keys = self.load_state_dict(combined_state_dict, strict=False)
-            self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
-        elif ckpt_path:
-            ckpt = self._load_ckpt(ckpt_path, load_ckpt_class_head)
-            incompatible_keys = self.load_state_dict(ckpt, strict=False)
-            self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head)
+        if ckpt_path:
+            # 准备键名映射
+            key_mapping = None
+            if da3_key_mapping:
+                key_mapping = lambda k: self._map_da3_key(k)
+            
+            if delta_weights:
+                logging.info("Delta weights mode")
+                self._zero_init_outside_encoder(skip_class_head=not load_ckpt_class_head)
+                current_state_dict = {k: v.cpu() for k, v in self.state_dict().items()}
+                if not load_ckpt_class_head:
+                    current_state_dict = {
+                        k: v
+                        for k, v in current_state_dict.items()
+                        if "class_head" not in k and "class_predictor" not in k
+                    }
+                ckpt = self._load_ckpt(ckpt_path, load_ckpt_class_head, key_mapping)  # ← 传递 key_mapping
+                combined_state_dict = self._add_state_dicts(current_state_dict, ckpt)
+                incompatible_keys = self.load_state_dict(combined_state_dict, strict=False)
+                self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head, allow_missing_for_da3=da3_key_mapping)
+            else:
+                # 正常加载模式
+                ckpt = self._load_ckpt(ckpt_path, load_ckpt_class_head, key_mapping)  # ← 传递 key_mapping
+                # DA3 特殊处理：移除 pos_embed 中的 cls token
+                if da3_key_mapping:
+                    ckpt = self._adjust_da3_pos_embed(ckpt)
+                incompatible_keys = self.load_state_dict(ckpt, strict=False)
+                self._raise_on_incompatible(incompatible_keys, load_ckpt_class_head, allow_missing_for_da3=da3_key_mapping)
 
         self.log = torch.compiler.disable(self.log)  # type: ignore
+
+    def _map_da3_key(self, key: str) -> str:
+        """将 DA3 的键名映射到 EoMT 的键名"""
+        # model.backbone.pretrained.* → network.encoder.backbone.*
+        if key.startswith("model.backbone.pretrained."):
+            return key.replace("model.backbone.pretrained.", "network.encoder.backbone.")
+        # model.backbone.* → network.encoder.backbone.*
+        elif key.startswith("model.backbone."):
+            return key.replace("model.backbone.", "network.encoder.backbone.")
+        # 跳过 depth head
+        elif key.startswith("model.head."):
+            return None  # 不加载
+        return key
+        
+
+    def _adjust_da3_pos_embed(self, ckpt):
+        """调整 DA3 的 pos_embed 以匹配当前模型
+        
+        DA3 的 pos_embed 包含 cls token: [1, 1+N, C]
+        timm 的 pos_embed 只包含 patches: [1, N, C]
+        """
+        pos_embed_key = "network.encoder.backbone.pos_embed"
+        
+        if pos_embed_key in ckpt:
+            ckpt_pos_embed = ckpt[pos_embed_key]  # DA3: [1, 1370, 768]
+            
+            try:
+                model_pos_embed = self.network.encoder.backbone.pos_embed  # timm: [1, 1369, 768]
+                
+                if ckpt_pos_embed.shape[1] == model_pos_embed.shape[1] + 1:
+                    # DA3 多了一个 cls token，移除它
+                    logging.info(f"Removing cls token from DA3 pos_embed: {ckpt_pos_embed.shape} -> {model_pos_embed.shape}")
+                    ckpt[pos_embed_key] = ckpt_pos_embed[:, 1:, :]  # 移除第一个 token (cls)
+                    logging.info(f"Adjusted pos_embed shape: {ckpt[pos_embed_key].shape}")
+                elif ckpt_pos_embed.shape != model_pos_embed.shape:
+                    logging.warning(f"pos_embed shape mismatch: checkpoint {ckpt_pos_embed.shape} vs model {model_pos_embed.shape}")
+            except Exception as e:
+                logging.warning(f"Could not adjust pos_embed: {e}")
+        
+        return ckpt  
 
     def configure_optimizers(self):
         encoder_param_names = {
@@ -896,21 +948,103 @@ class LightningModule(lightning.LightningModule):
 
         return summed
 
-    def _load_ckpt(self, ckpt_path, load_ckpt_class_head):
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        if "state_dict" in ckpt:
-            ckpt = ckpt["state_dict"]
+    # def _load_ckpt(self, ckpt_path, load_ckpt_class_head):
+    #     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    #     if "state_dict" in ckpt:
+    #         ckpt = ckpt["state_dict"]
+    #     ckpt = {k: v for k, v in ckpt.items() if "criterion.empty_weight" not in k}
+    #     if not load_ckpt_class_head:
+    #         ckpt = {
+    #             k: v
+    #             for k, v in ckpt.items()
+    #             if "class_head" not in k and "class_predictor" not in k
+    #         }
+    #     logging.info(f"Loaded {len(ckpt)} keys")
+    #     return ckpt
+    def _load_ckpt(self, ckpt_path, load_ckpt_class_head, key_mapping=None):
+        """
+        Load checkpoint from either PyTorch (.pth, .ckpt) or SafeTensors (.safetensors) format.
+        
+        Args:
+            ckpt_path: Path to checkpoint file
+            load_ckpt_class_head: Whether to load class head weights
+            key_mapping: Optional callable to map checkpoint keys (returns None to skip)
+            
+        Returns:
+            State dict
+        """
+        # 检测文件格式
+        import os
+        file_ext = os.path.splitext(ckpt_path)[1].lower()
+        
+        if file_ext == '.safetensors':
+            # 加载 SafeTensors 格式
+            logging.info(f"Loading SafeTensors checkpoint from {ckpt_path}")
+            ckpt = load_safetensors(ckpt_path)
+        else:
+            # 加载 PyTorch 格式 (.pth, .ckpt, etc.)
+            logging.info(f"Loading PyTorch checkpoint from {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            
+            # PyTorch checkpoints 可能包含 'state_dict' 键
+            if "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+        
+        # 移除不需要的键
         ckpt = {k: v for k, v in ckpt.items() if "criterion.empty_weight" not in k}
+        
+        # 可选：不加载 class head
         if not load_ckpt_class_head:
             ckpt = {
                 k: v
                 for k, v in ckpt.items()
                 if "class_head" not in k and "class_predictor" not in k
             }
-        logging.info(f"Loaded {len(ckpt)} keys")
+        
+        logging.info(f"Loaded {len(ckpt)} keys from {file_ext} format")
+        
+        # 应用键名映射（如果提供）
+        if key_mapping is not None:
+            logging.info("Applying key mapping...")
+            mapped_ckpt = {}
+            skipped_keys = []
+            for k, v in ckpt.items():
+                new_key = key_mapping(k)
+                if new_key is None:
+                    skipped_keys.append(k)
+                    continue  # 跳过这个键
+                mapped_ckpt[new_key] = v
+            
+            logging.info(f"Mapped {len(mapped_ckpt)} keys, skipped {len(skipped_keys)} keys")
+            if skipped_keys:
+                logging.info(f"Skipped keys: {skipped_keys[:10]}...")  # 只显示前10个
+            ckpt = mapped_ckpt
+        
         return ckpt
 
-    def _raise_on_incompatible(self, incompatible_keys, load_ckpt_class_head):
+    # def _raise_on_incompatible(self, incompatible_keys, load_ckpt_class_head):
+    #     if incompatible_keys.missing_keys:
+    #         if not load_ckpt_class_head:
+    #             missing_keys = [
+    #                 key
+    #                 for key in incompatible_keys.missing_keys
+    #                 if "class_head" not in key and "class_predictor" not in key
+    #             ]
+    #         else:
+    #             missing_keys = incompatible_keys.missing_keys
+    #         if missing_keys:
+    #             raise ValueError(f"Missing keys: {missing_keys}")
+    #     if incompatible_keys.unexpected_keys:
+    #         raise ValueError(f"Unexpected keys: {incompatible_keys.unexpected_keys}")
+    def _raise_on_incompatible(self, incompatible_keys, load_ckpt_class_head, allow_missing_for_da3=False):
+        """
+        检查不兼容的 keys
+        
+        Args:
+            incompatible_keys: PyTorch load_state_dict 返回的不兼容 keys
+            load_ckpt_class_head: 是否加载 class head
+            allow_missing_for_da3: 是否允许 DA3 迁移学习的 missing keys
+        """
         if incompatible_keys.missing_keys:
             if not load_ckpt_class_head:
                 missing_keys = [
@@ -920,7 +1054,47 @@ class LightningModule(lightning.LightningModule):
                 ]
             else:
                 missing_keys = incompatible_keys.missing_keys
+            
+            # 如果是 DA3 迁移学习，过滤掉预期的 missing keys
+            if allow_missing_for_da3:
+                expected_missing_da3 = [
+                    'network.attn_mask_probs',           # EoMT 特有
+                    'network.encoder.pixel_mean',        # 预处理参数
+                    'network.encoder.pixel_std',         # 预处理参数
+                    'network.encoder.backbone.reg_token', # Register token (DA3没有)
+                    'network.q.weight',                  # Query embeddings
+                    'network.class_head',                # Class head
+                ]
+                
+                # 同时允许 mask_head 和 upscale 的所有子参数
+                filtered_missing = []
+                for key in missing_keys:
+                    is_expected = False
+                    # 检查是否是预期的 missing key
+                    for expected in expected_missing_da3:
+                        if key == expected or key.startswith(expected):
+                            is_expected = True
+                            break
+                    # 检查是否是 mask_head 或 upscale 的参数
+                    if 'mask_head' in key or 'upscale' in key:
+                        is_expected = True
+                    
+                    if not is_expected:
+                        filtered_missing.append(key)
+                
+                missing_keys = filtered_missing
+                
+                if missing_keys:
+                    logging.warning(f"Unexpected missing keys (not from DA3): {missing_keys}")
+                else:
+                    logging.info(f"All missing keys are expected for DA3 transfer learning")
+            
             if missing_keys:
                 raise ValueError(f"Missing keys: {missing_keys}")
+        
         if incompatible_keys.unexpected_keys:
-            raise ValueError(f"Unexpected keys: {incompatible_keys.unexpected_keys}")
+            # Unexpected keys 通常可以忽略（来自 checkpoint 但模型不需要的参数）
+            logging.warning(f"Unexpected keys (will be ignored): {incompatible_keys.unexpected_keys[:10]}...")
+            # 如果不是 DA3 迁移，才抛出错误
+            if not allow_missing_for_da3:
+                raise ValueError(f"Unexpected keys: {incompatible_keys.unexpected_keys}")

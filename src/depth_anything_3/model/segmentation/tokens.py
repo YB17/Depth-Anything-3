@@ -41,6 +41,7 @@ class SegmentationTokens(nn.Module):
         S0 = self.queries.expand(batch, -1, -1).type_as(geom_tokens)
 
         # B0 = self.bottleneck.expand(batch, -1, -1).to(device=geom_tokens.device, dtype=geom_tokens.dtype)
-        G_seg0 = geom_tokens.detach().clone()
+        # G_seg0 = geom_tokens.detach().clone()
+        G_seg0 = geom_tokens.clone()
         # S0 = self.queries.expand(batch, -1, -1).to(device=geom_tokens.device, dtype=geom_tokens.dtype)
         return B0, G_seg0, S0

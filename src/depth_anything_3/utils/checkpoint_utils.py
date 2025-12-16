@@ -59,12 +59,12 @@ def load_da3_pretrained_backbone(
         strict: Whether to enforce strict loading via ``load_state_dict``.
         possible_prefixes: Collection of prefixes to try stripping from checkpoint keys.
     """
-
+    log.info("------ load_da3_pretrained_backbone ------")
     if not ckpt_path:
         log.info("No DA3 pretrained path provided; skipping backbone initialization.")
         return
     if not os.path.isfile(ckpt_path):
-        log.warning("DA3 pretrained checkpoint not found at %s; skipping.", ckpt_path)
+        log.info("DA3 pretrained checkpoint not found at %s; skipping.", ckpt_path)
         return
 
     log.info("Loading DA3 pretrained backbone from %s", ckpt_path)

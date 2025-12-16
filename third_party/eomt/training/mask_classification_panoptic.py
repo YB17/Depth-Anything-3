@@ -41,6 +41,7 @@ class MaskClassificationPanoptic(LightningModule):
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
+        da3_key_mapping=False,
     ):
         super().__init__(
             network=network,
@@ -59,6 +60,7 @@ class MaskClassificationPanoptic(LightningModule):
             ckpt_path=ckpt_path,
             delta_weights=delta_weights,
             load_ckpt_class_head=load_ckpt_class_head,
+            da3_key_mapping=da3_key_mapping,
         )
 
         self.save_hyperparameters(ignore=["_class_path"])

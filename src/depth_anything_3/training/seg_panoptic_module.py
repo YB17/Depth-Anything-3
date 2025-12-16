@@ -107,19 +107,26 @@ class DA3SegPanopticModule(pl.LightningModule):
         if ckpt_path:
             # DinoV2 内部的 pretrained 属性才是实际的 DinoVisionTransformer
             # checkpoint 的键对应的是 DinoVisionTransformer 的结构
-            target_backbone = getattr(self.network.backbone, 'pretrained', self.network.backbone)
+            # target_backbone = getattr(self.network.backbone, 'pretrained', self.network.backbone)
+            target_backbone = getattr(self.network, 'pretrained', self.network)
             rank_zero_only(load_da3_pretrained_backbone)(
                 target_backbone, ckpt_path, strict=False
             )
+        else:
+            print("😂😂😂ckpt_path is None or backbone is not found!😂😂😂")
 
         self.num_masked_layers = num_masked_layers
         if self.num_masked_layers is None:
-            self.num_masked_layers = getattr(self.network.backbone, "num_seg_masked_layers", 0)
+            # self.num_masked_layers = getattr(self.network.backbone, "num_seg_masked_layers", 0)
+            self.num_masked_layers = getattr(self.network, "num_seg_masked_layers", 0)
 
-        embed_dim = getattr(self.network.backbone, "embed_dim", None)
+        # embed_dim = getattr(self.network.backbone, "embed_dim", None)
+        embed_dim = getattr(self.network, "embed_dim", None)
         patch_grid = None
-        if hasattr(self.network.backbone, "patch_embed"):
-            patch_grid = getattr(self.network.backbone.patch_embed, "patches_resolution", None)
+        # if hasattr(self.network.backbone, "patch_embed"):
+        if hasattr(self.network, "patch_embed"):
+            # patch_grid = getattr(self.network.backbone.patch_embed, "patches_resolution", None)
+            patch_grid = getattr(self.network.patch_embed, "patches_resolution", None)
         self.seg_head = EoMTSegHead(
             embed_dim=embed_dim,
             num_queries=num_queries,
@@ -191,21 +198,22 @@ class DA3SegPanopticModule(pl.LightningModule):
         """冻结DA3 backbone和depth head，只训练segmentation相关组件"""
         
         # 1. 冻结整个backbone（除了segmentation相关部分）
-        backbone = self.network.backbone
-        if hasattr(backbone, 'pretrained'):
-            backbone = backbone.pretrained
+        # backbone = self.network.backbone
+        # backbone = self.network
+        # if hasattr(backbone, 'pretrained'):
+        #     backbone = backbone.pretrained
         
-        for name, param in backbone.named_parameters():
-            # 只有seg_相关的参数保持可训练
-            if 'seg_tokens' in name or 'seg_blocks' in name or 'seg_adapter' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+        # for name, param in backbone.named_parameters():
+        #     # 只有seg_相关的参数保持可训练
+        #     if 'seg_tokens' in name or 'seg_blocks' in name or 'seg_adapter' in name:
+        #         param.requires_grad = True
+        #     else:
+        #         param.requires_grad = False
         
         # 2. 冻结depth head (DualDPT)
-        if hasattr(self.network, 'head') and self.network.head is not None:
-            for param in self.network.head.parameters():
-                param.requires_grad = False
+        # if hasattr(self.network, 'head') and self.network.head is not None:
+        #     for param in self.network.head.parameters():
+        #         param.requires_grad = False
         
         # 3. 确保seg_head可训练
         for param in self.seg_head.parameters():
@@ -235,17 +243,18 @@ class DA3SegPanopticModule(pl.LightningModule):
             seg_cfg=net_config.get('seg_cfg'),
         )
         
+        return net
         # 构建head
-        head_config = config.get('head', {})
-        head = DualDPT(
-            dim_in=head_config.get('dim_in', 1536),
-            output_dim=head_config.get('output_dim', 2),
-            features=head_config.get('features', 128),
-            out_channels=head_config.get('out_channels', [96, 192, 384, 768]),
-        )
+        # head_config = config.get('head', {})
+        # head = DualDPT(
+        #     dim_in=head_config.get('dim_in', 1536),
+        #     output_dim=head_config.get('output_dim', 2),
+        #     features=head_config.get('features', 128),
+        #     out_channels=head_config.get('out_channels', [96, 192, 384, 768]),
+        # )
         
         # 构建完整网络
-        return DepthAnything3Net(net=net, head=head)
+        # return DepthAnything3Net(net=net, head=head)
 
     def _compute_annealing_schedule(self, total_steps: int) -> None:
         if not self.attn_mask_annealing_enabled or self.num_masked_layers == 0:
@@ -321,8 +330,16 @@ class DA3SegPanopticModule(pl.LightningModule):
         return attn_mask
 
     def _extract_seg_tokens(self, output: Any) -> Dict[str, Any]:
+        # 处理 DinoV2 返回的三元组 (outputs, aux_outputs, seg_output)
+        if isinstance(output, tuple) and len(output) == 3:
+            _, _, seg_output = output
+            return seg_output if seg_output is not None else {}
+        
+        # 处理原来 DepthAnything3Net 返回的字典格式（向后兼容）
         if isinstance(output, dict):
             return output.get("seg_tokens", {})
+        
+        # 处理具有 seg_tokens 属性的对象
         return getattr(output, "seg_tokens", {})
 
     def forward(
@@ -511,7 +528,8 @@ class DA3SegPanopticModule(pl.LightningModule):
 
     def configure_optimizers(self):
         param_groups: List[Dict[str, Any]] = []
-        vit_depth = len(getattr(self.network.backbone, "blocks", [])) if hasattr(self.network, "backbone") else 0
+        # vit_depth = len(getattr(self.network.backbone, "blocks", [])) if hasattr(self.network, "backbone") else 0
+        vit_depth = len(getattr(self.network, "blocks", [])) if hasattr(self.network, "pretrained") else 0
         num_backbone_params = 0
 
         for name, param in self.network.named_parameters():
@@ -521,11 +539,12 @@ class DA3SegPanopticModule(pl.LightningModule):
             lr = self.lr * self.lr_mult
             decay = self.weight_decay
 
-            if "backbone" in name:
+            # if "backbone" in name:
+            if "pretrained" in name:
                 num_backbone_params += 1
-            if "backbone.blocks" in name and vit_depth > 0:
+            if "pretrained.blocks" in name and vit_depth > 0:
                 try:
-                    block_idx = int(name.split("backbone.blocks.")[1].split(".")[0])
+                    block_idx = int(name.split("pretrained.blocks.")[1].split(".")[0])
                     decay_factor = self.llrd ** (vit_depth - block_idx - 1)
                     lr = lr * decay_factor
                 except ValueError:

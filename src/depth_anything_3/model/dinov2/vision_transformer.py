@@ -436,8 +436,8 @@ class DinoVisionTransformer(nn.Module):
                     geom_for_seg = torch.cat([geom_prefix, z_seg], dim=1)
                     if i in self.distill_layers:
                         distill_tokens[i] = z_teacher
-                elif i in self.distill_layers:
-                    distill_tokens[i] = geom_for_seg[:, patch_start:, :]
+                # elif i in self.distill_layers:
+                #     distill_tokens[i] = geom_for_seg[:, patch_start:, :]
                 attn_mask = None
                 if (
                     self.training

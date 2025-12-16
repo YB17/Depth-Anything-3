@@ -11,7 +11,8 @@ trainer:
       name: stage1_da3b_coco640
   devices: 8
   accelerator: gpu
-  strategy: ddp_find_unused_parameters_true
+  strategy: ddp
+  accumulate_grad_batches: 4
   precision: 16-mixed
   check_val_every_n_epoch: 1
   limit_val_batches: 1.0
@@ -20,7 +21,7 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: checkpoints/stage1_da3b_coco640  # 保存目录
+        dirpath: checkpoints/stage1_da3b_coco640/raw  # 保存目录
         filename: 'epoch={epoch}-step={step}-loss={train_loss:.4f}'  # 文件名格式
         monitor: train_loss  # 监控的指标
         mode: min  # 最小化loss
@@ -36,7 +37,9 @@ trainer:
         max_depth: 2
 
 model:
-  da3_pretrained_path: "/cache/model/da3/"
+  # da3_pretrained_path: "/cache/model/da3/"
+  da3_pretrained_path: "/cache/model/dinov2/"
+  # da3_pretrained_path: ""
   network_config:
     enable_dino_teacher: false
     dino_teacher_ckpt: "/cache/model/dinov3/dinov3_vitb16_pretrain.pth"
@@ -59,11 +62,12 @@ model:
         dropout: 0.0
         attn_dropout: 0.0
         enable_dino_teacher: false
-        distill_layers: [5, 6, 7, 8, 9, 10, 11]
+        # distill_layers: [5, 6, 7, 8, 9, 10, 11]
+        distill_layers: []
         dino_d_base: 384
         dino_teacher_dim: 768
         dino_seg_dim: 768
-        enable_seg_adapter: true
+        enable_seg_adapter: false
     head:
       dim_in: 1536
       output_dim: 2
@@ -72,11 +76,11 @@ model:
   img_size: [518, 518]
   num_classes: 133
   enable_panoptic_eval: true
-  mask_thresh: 0.8
-  overlap_thresh: 0.8
+  mask_thresh: 0.25
+  overlap_thresh: 0.25
   attn_mask_annealing_enabled: false
   num_masked_layers: 4
-  lr:          0.0004      # 从 2e-4 提到 4e-4
+  lr:          0.0002      # 从 2e-4 提到 4e-4
   llrd:        0.8         # 保持不变
   weight_decay: 0.04       # 保持不变
   warmup_steps: [500, 1000]

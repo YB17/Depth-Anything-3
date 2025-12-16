@@ -21,10 +21,10 @@ torchrun --standalone --nproc_per_node=4 \
   --trainer.accelerator gpu \
   --trainer.strategy ddp_find_unused_parameters_true \
   --trainer.precision 16-mixed \
-  --model.lr 0.0004 \
+  # --model.lr 0.0004 \
   --model.num_masked_layers 4 \
   --model.attn_mask_annealing_enabled false \
-  --model.da3_pretrained_path=/cache/model/da3/ \
+  # --model.da3_pretrained_path=/cache/model/da3/ \
   # --model.enable_dino_teacher true \
   # --model.dino_teacher_ckpt /cache/model/dinov3/dinov3_vitb16_pretrain.pth \
 #  --resume_from_weights /cache/model/stage1_da3b_coco640/last.ckpt
