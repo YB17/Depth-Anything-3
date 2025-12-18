@@ -1,0 +1,70 @@
+trainer:
+  max_epochs: 20
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "baseline0_da3class_pcgrad_lora"
+  accelerator: gpu
+  devices: 8
+  precision: 16-mixed
+  strategy: ddp_find_unused_parameters_true
+
+model:
+  class_path: training.mask_classification_panoptic.MaskClassificationPanoptic
+  init_args:
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [14782, 36955, 59128]
+    attn_mask_annealing_end_steps: [29564, 51737, 73910]
+    lr: 0.0004
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [1000, 2000]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        num_blocks: 3
+        encoder:
+          class_path: models.da3_adapter.DA3BackboneAdapter
+          init_args:
+            da3_config_path: src/depth_anything_3/configs/da3-base.yaml
+            da3_ckpt_path: /path/to/da3_student.ckpt
+            lora:
+              enabled: true
+              r: 8
+              alpha: 16
+              dropout: 0.05
+              target: qv_ffn
+              layers: last6
+              train_bias: none
+              merge_weights_for_eval: false
+              init_scale: 0.01
+    baseline0:
+      baseline0_enabled: true
+      depth_teacher_ckpt: /path/to/da3_teacher.ckpt
+      backbone_lr_mult: 0.1
+      lora_lr_mult: 5.0
+      lambda_old: 1.0
+      beta_depth_grad: 0.5
+      pcgrad_enabled: true
+      pcgrad_eps: 1e-12
+      freeze_depth_head: true
+      unfreeze_encoder_layers: 12
+      warmup_epochs: 1
+      anchor_on: depth
+      log_conflict_stats: true
+
+data:
+  class_path: datasets.coco_panoptic.COCOPanoptic
+  init_args:
+    stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]
+    path: /path/to/coco/panoptic
+    batch_size: 2
+    num_workers: 8
+    img_size: [640, 640]
+    check_empty_targets: True
+
+# Run:
+# python third_party/eomt/main.py fit --config third_party/eomt/configs/baseline0_da3class_panoptic_pcgrad_lora.yaml

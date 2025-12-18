@@ -45,6 +45,7 @@ class MaskClassificationPanopticDistill(MaskClassificationPanoptic):
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
         distill: Optional[dict] = None,
+        baseline0: Optional[dict] = None,
     ):
         super().__init__(
             network=network,
@@ -73,6 +74,7 @@ class MaskClassificationPanopticDistill(MaskClassificationPanoptic):
             ckpt_path=ckpt_path,
             delta_weights=delta_weights,
             load_ckpt_class_head=load_ckpt_class_head,
+            baseline0=baseline0,
         )
 
         self.distill_cfg = distill or {}
@@ -100,6 +102,96 @@ class MaskClassificationPanopticDistill(MaskClassificationPanoptic):
 
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
+
+        if self.baseline0_enabled:
+            optim = self.optimizers()
+            schedulers = self.lr_schedulers()
+            self._freeze_depth_head()
+
+            student_outputs = self(
+                imgs,
+                return_backbone_feats=True,
+                return_seg_layers=True,
+            )
+            panoptic_tuple, _, _ = self._split_panoptic_outputs(
+                student_outputs["panoptic"] if isinstance(student_outputs, dict) else student_outputs
+            )
+            mask_logits, class_logits = panoptic_tuple
+            loss_gt, _ = self.compute_panoptic_loss(mask_logits, class_logits, targets)
+
+            with torch.no_grad():
+                teacher_outputs = self.teacher_model(
+                    imgs / 255.0,
+                    return_backbone_feats=True,
+                    return_seg_layers=True,
+                )
+
+            loss_feat = self._compute_feature_distill_loss(
+                student_outputs.get("backbone_feats", None)
+                if isinstance(student_outputs, dict)
+                else None,
+                teacher_outputs.get("backbone_feats", None)
+                if isinstance(teacher_outputs, dict)
+                else None,
+            )
+
+            loss_cls_kl, loss_mask_bce = self._compute_logit_distill_loss(
+                student_outputs["seg_layers"][-1],
+                teacher_outputs["seg_layers"][-1],
+            )
+
+            loss_distill = (
+                self.lambda_feat * loss_feat
+                + self.lambda_logit * (loss_cls_kl + loss_mask_bce)
+            )
+
+            loss_pan = loss_gt + loss_distill
+
+            loss_old = torch.tensor(0.0, device=self.device)
+            if hasattr(self.network, "encoder") and hasattr(self.network.encoder, "forward_depth"):
+                depth_s = self.network.encoder.forward_depth(imgs)
+                if depth_s is not None and self.baseline0_cfg["anchor_on"] == "depth":
+                    teacher_out = self.depth_teacher_forward(batch)
+                    depth_t = teacher_out["depth_t"]
+                    valid_t = teacher_out.get("valid_mask", None)
+                    if depth_s.ndim == 5:
+                        depth_s = depth_s.view(-1, *depth_s.shape[2:])
+                    loss_old, stats = self.depth_anchor_loss(
+                        depth_s, depth_t, valid_t
+                    )
+                    for key, val in stats.items():
+                        self.log(f"baseline0/{key}", val, on_step=True, on_epoch=True, prog_bar=False)
+
+            total = loss_pan + loss_old
+            warmup = self.baseline0_cfg["warmup_epochs"]
+            if self.current_epoch < warmup:
+                self._set_encoder_trainable_layers(0)
+                optim.zero_grad(set_to_none=True)
+                self.manual_backward(loss_pan)
+                optim.step()
+            else:
+                self._set_encoder_trainable_layers(self.baseline0_cfg["unfreeze_encoder_layers"])
+                if self.baseline0_cfg["pcgrad_enabled"]:
+                    self.pcgrad_step_on_encoder(loss_pan, loss_old, optim)
+                else:
+                    optim.zero_grad(set_to_none=True)
+                    self.manual_backward(total)
+                    optim.step()
+
+            if schedulers is not None:
+                if isinstance(schedulers, list):
+                    for sch in schedulers:
+                        sch.step()
+                else:
+                    schedulers.step()
+
+            self.log("train_loss_gt", loss_gt.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("train_loss_feat", loss_feat.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("train_loss_cls_kl", loss_cls_kl.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("train_loss_mask_bce", loss_mask_bce.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("train_loss_distill", loss_distill.detach(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("train_loss_total", total.detach(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+            return total.detach()
 
         student_outputs = self(
             imgs,
@@ -187,66 +279,8 @@ class MaskClassificationPanopticDistill(MaskClassificationPanoptic):
         return loss_total
 
     def configure_optimizers(self):
-        encoder_param_names = {
-            n for n, _ in self.network.encoder.backbone.named_parameters()
-        }
-        backbone_param_groups = []
-        other_param_groups = []
-        backbone_blocks = len(self.network.encoder.backbone.blocks)
-        block_i = backbone_blocks
-
-        l2_blocks = torch.arange(
-            backbone_blocks - self.network.num_blocks, backbone_blocks
-        ).tolist()
-
-        for name, param in reversed(list(self.named_parameters())):
-            if not param.requires_grad or name.startswith("teacher_model"):
-                continue
-
-            lr = self.lr
-
-            if name.replace("network.encoder.backbone.", "") in encoder_param_names:
-                name_list = name.split(".")
-
-                is_block = False
-                for i, key in enumerate(name_list):
-                    if key == "blocks":
-                        block_i = int(name_list[i + 1])
-                        is_block = True
-
-                if is_block or block_i == 0:
-                    lr *= self.llrd ** (backbone_blocks - 1 - block_i)
-
-                elif (is_block or block_i == 0) and self.lr_mult != 1.0:
-                    lr *= self.lr_mult
-
-                if "backbone.norm" in name:
-                    lr = self.lr
-
-                if (
-                    is_block
-                    and (block_i in l2_blocks)
-                    and ((not self.llrd_l2_enabled) or (self.lr_mult != 1.0))
-                ):
-                    lr = self.lr
-
-                backbone_param_groups.append(
-                    {"params": [param], "lr": lr, "name": name}
-                )
-            else:
-                other_param_groups.append(
-                    {"params": [param], "lr": self.lr, "name": name}
-                )
-
-        param_groups = backbone_param_groups + other_param_groups
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=self.weight_decay)
-
-        scheduler = TwoStageWarmupPolySchedule(
-            optimizer,
-            num_backbone_params=len(backbone_param_groups),
-            warmup_steps=self.warmup_steps,
-            total_steps=self.trainer.estimated_stepping_batches,
-            poly_power=self.poly_power,
+        optimizer, scheduler, _ = self._build_optimizer_and_scheduler(
+            ignore_prefixes=("teacher_model",)
         )
 
         return {
