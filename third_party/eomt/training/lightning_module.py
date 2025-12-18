@@ -8,8 +8,9 @@
 # All used under the Apache 2.0 License.
 # ---------------------------------------------------------------
 
+import copy
 import math
-from typing import Optional, cast
+from typing import Any, Dict, Optional, Tuple, cast
 import lightning
 from lightning.fabric.utilities import rank_zero_info
 import torch
@@ -61,6 +62,7 @@ class LightningModule(lightning.LightningModule):
         delta_weights=False,
         load_ckpt_class_head=True,
         da3_key_mapping=False,
+        baseline0: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -77,8 +79,24 @@ class LightningModule(lightning.LightningModule):
         self.poly_power = poly_power
         self.warmup_steps = warmup_steps
         self.llrd_l2_enabled = llrd_l2_enabled
+        self.baseline0_cfg = self._build_baseline0_cfg(baseline0 or {})
+        self.baseline0_enabled = bool(self.baseline0_cfg["baseline0_enabled"])
+
+        if self.baseline0_enabled:
+            self.automatic_optimization = False  # type: ignore[assignment]
+            self._freeze_depth_head()
+
+        if hasattr(self.network, "encoder") and hasattr(self.network.encoder, "lora_report"):
+            report = getattr(self.network.encoder, "lora_report", {})
+            if report.get("modules", 0) > 0:
+                rank_zero_info(
+                    f"[LoRA] injected modules={report.get('modules')} layers={report.get('layers')} "
+                    f"trainable_lora={report.get('trainable_lora')}"
+                )
 
         self.strict_loading = False
+        self._depth_teacher = None
+        self._warned_missing_depth = False
 
         if ckpt_path:
             # 准备键名映射
@@ -151,66 +169,422 @@ class LightningModule(lightning.LightningModule):
         
         return ckpt  
 
-    def configure_optimizers(self):
-        encoder_param_names = {
-            n for n, _ in self.network.encoder.backbone.named_parameters()
+    def _build_baseline0_cfg(self, cfg: dict) -> dict:
+        """Assemble baseline-0 configuration with safe defaults."""
+
+        defaults = {
+            "baseline0_enabled": False,
+            "depth_teacher_ckpt": "",
+            "depth_teacher_config": "",
+            "lambda_old": 1.0,
+            "beta_depth_grad": 0.5,
+            "pcgrad_enabled": True,
+            "pcgrad_eps": 1e-12,
+            "backbone_lr_mult": 0.1,
+            "lora_lr_mult": 5.0,
+            "freeze_depth_head": True,
+            "unfreeze_encoder_layers": 12,
+            "warmup_epochs": 1,
+            "anchor_on": "depth",
+            "log_conflict_stats": True,
         }
-        backbone_param_groups = []
-        other_param_groups = []
-        backbone_blocks = len(self.network.encoder.backbone.blocks)
-        block_i = backbone_blocks
+        merged = {**defaults, **cfg}
+        merged["unfreeze_encoder_layers"] = int(merged["unfreeze_encoder_layers"])
+        return merged
 
-        l2_blocks = torch.arange(
-            backbone_blocks - self.network.num_blocks, backbone_blocks
-        ).tolist()
+    def _freeze_depth_head(self):
+        if not self.baseline0_cfg["freeze_depth_head"]:
+            return
 
-        for name, param in reversed(list(self.named_parameters())):
+        encoder = getattr(self.network, "encoder", None)
+        depth_head = None
+        if encoder is not None:
+            if hasattr(encoder, "depth_head"):
+                depth_head = encoder.depth_head
+            elif hasattr(encoder, "head"):
+                depth_head = encoder.head
+            elif hasattr(encoder, "da3"):
+                depth_head = encoder.da3.head
+
+        if depth_head is None:
+            return
+
+        for p in depth_head.parameters():
+            p.requires_grad = False
+
+    def _set_encoder_trainable_layers(self, num_layers: int):
+        encoder = getattr(self.network, "encoder", None)
+        backbone = getattr(encoder, "backbone", None) if encoder is not None else None
+        if backbone is None or not hasattr(backbone, "blocks"):
+            return
+
+        total_blocks = len(backbone.blocks)
+        start_idx = max(total_blocks - num_layers, 0)
+        for idx, block in enumerate(backbone.blocks):
+            requires_grad = idx >= start_idx
+            for p in block.parameters():
+                p.requires_grad = requires_grad
+
+        if hasattr(backbone, "patch_embed"):
+            for p in backbone.patch_embed.parameters():
+                p.requires_grad = num_layers > 0
+        if hasattr(backbone, "pos_embed"):
+            backbone.pos_embed.requires_grad = num_layers > 0
+
+    def _is_lora_param(self, name: str) -> bool:
+        lowered = name.lower()
+        return "lora" in lowered or "adapter" in lowered
+
+    def _build_optimizer_and_scheduler(
+        self, ignore_prefixes: Optional[tuple[str, ...]] = None
+    ) -> tuple[AdamW, TwoStageWarmupPolySchedule, int]:
+        from third_party.eomt.models.da3_adapter import DA3BackboneAdapter, LoRALinear
+
+        encoder = getattr(self.network, "encoder", None)
+        backbone = getattr(encoder, "backbone", None) if encoder is not None else None
+        adapter = encoder if isinstance(encoder, DA3BackboneAdapter) else None
+
+        encoder_param_ids = (
+            {id(p) for _, p in encoder.named_parameters()} if encoder is not None else set()
+        )
+        backbone_param_ids = (
+            {id(p) for _, p in backbone.named_parameters()}
+            if backbone is not None and hasattr(backbone, "named_parameters")
+            else set()
+        )
+        backbone_blocks = len(backbone.blocks) if backbone is not None and hasattr(backbone, "blocks") else 0
+        l2_blocks = (
+            torch.arange(backbone_blocks - getattr(self.network, "num_blocks", 0), backbone_blocks).tolist()
+            if backbone_blocks > 0 and hasattr(self.network, "num_blocks")
+            else []
+        )
+
+        backbone_lr_mult = self.baseline0_cfg["backbone_lr_mult"] if self.baseline0_enabled else 1.0
+        lora_lr_mult = self.baseline0_cfg["lora_lr_mult"] if self.baseline0_enabled else 1.0
+
+        param_groups: list[dict[str, Any]] = []
+        backbone_group_count = 0
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if ignore_prefixes is not None and any(name.startswith(pfx) for pfx in ignore_prefixes):
+                continue
+            if adapter is not None and adapter.is_depth_head_param(param):
+                continue
+
+            is_backbone = id(param) in backbone_param_ids
+            is_encoder = id(param) in encoder_param_ids
+            block_idx = adapter.block_index_for_param(param) if adapter is not None else None
+            is_lora = self._is_lora_param(name)
+
             lr = self.lr
+            weight_decay = self.weight_decay
 
-            if name.replace("network.encoder.backbone.", "") in encoder_param_names:
-                name_list = name.split(".")
-
-                is_block = False
-                for i, key in enumerate(name_list):
-                    if key == "blocks":
-                        block_i = int(name_list[i + 1])
-                        is_block = True
-
-                if is_block or block_i == 0:
-                    lr *= self.llrd ** (backbone_blocks - 1 - block_i)
-
-                elif (is_block or block_i == 0) and self.lr_mult != 1.0:
-                    lr *= self.lr_mult
-
-                if "backbone.norm" in name:
+            if adapter is not None:
+                if block_idx is not None:
+                    llrd_factor = self.llrd ** (backbone_blocks - 1 - block_idx) if backbone_blocks > 0 else 1.0
+                    lr = self.lr * (lora_lr_mult if is_lora else backbone_lr_mult) * llrd_factor
+                    if is_lora:
+                        weight_decay = 0.0
+                    backbone_group_count += 1
+                else:
                     lr = self.lr
-
-                if (
-                    is_block
-                    and (block_i in l2_blocks)
-                    and ((not self.llrd_l2_enabled) or (self.lr_mult != 1.0))
-                ):
-                    lr = self.lr
-
-                backbone_param_groups.append(
-                    {"params": [param], "lr": lr, "name": name}
-                )
             else:
-                other_param_groups.append(
-                    {"params": [param], "lr": self.lr, "name": name}
-                )
+                if is_backbone:
+                    block_idx = None
+                    if ".blocks." in name:
+                        try:
+                            after = name.split(".blocks.", 1)[1]
+                            block_idx = int(after.split(".", 1)[0])
+                        except Exception:
+                            block_idx = None
+                    llrd_factor = (
+                        self.llrd ** (backbone_blocks - 1 - block_idx)
+                        if block_idx is not None and backbone_blocks > 0
+                        else 1.0
+                    )
+                    if block_idx in l2_blocks and ((not self.llrd_l2_enabled) or (self.lr_mult != 1.0)):
+                        llrd_factor = 1.0
+                    base_mult = lora_lr_mult if is_lora else backbone_lr_mult
+                    lr = self.lr * base_mult * llrd_factor
+                    if block_idx is None and self.lr_mult != 1.0:
+                        lr *= self.lr_mult
+                    if is_lora:
+                        weight_decay = 0.0
+                    backbone_group_count += 1
+                elif is_encoder:
+                    lr = self.lr * backbone_lr_mult
+                    backbone_group_count += 1
 
-        param_groups = backbone_param_groups + other_param_groups
+            group = {"params": [param], "lr": lr, "name": name, "weight_decay": weight_decay}
+            param_groups.append(group)
+
         optimizer = AdamW(param_groups, weight_decay=self.weight_decay)
-
         scheduler = TwoStageWarmupPolySchedule(
             optimizer,
-            num_backbone_params=len(backbone_param_groups),
+            num_backbone_params=backbone_group_count,
             warmup_steps=self.warmup_steps,
             total_steps=self.trainer.estimated_stepping_batches,
             poly_power=self.poly_power,
         )
+        return optimizer, scheduler, backbone_group_count
 
+    def _maybe_forward_depth(self, imgs: torch.Tensor, **kwargs) -> Optional[torch.Tensor]:
+        """Try to obtain a student depth prediction without changing existing flows."""
+
+        encoder = getattr(self.network, "encoder", None)
+        if encoder is None:
+            return None
+
+        # Try explicit depth forward
+        for candidate in ("forward_depth", "forward_with_depth"):
+            if hasattr(encoder, candidate):
+                try:
+                    depth_out = getattr(encoder, candidate)(imgs, **kwargs)
+                    depth_pred, _ = self._extract_depth_from_output(depth_out)
+                    if depth_pred is not None:
+                        return depth_pred
+                except Exception:
+                    pass
+
+        # Try regular forward with depth hints
+        try:
+            depth_out = encoder(imgs, return_depth=True, **kwargs)
+            depth_pred, _ = self._extract_depth_from_output(depth_out)
+            if depth_pred is not None:
+                return depth_pred
+        except Exception:
+            pass
+
+        return None
+
+    def _extract_depth_from_output(
+        self, output: Any
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Extract depth tensor and optional validity mask from arbitrary outputs."""
+
+        depth = None
+        valid = None
+        if output is None:
+            return None, None
+
+        if isinstance(output, dict):
+            for key in ("depth", "depths", "pred_depth", "pred_depths"):
+                if key in output:
+                    depth = output[key]
+                    break
+            for key in ("valid_mask", "depth_mask", "mask"):
+                if key in output:
+                    valid = output[key]
+                    break
+        else:
+            if hasattr(output, "depth"):
+                depth = output.depth
+            if hasattr(output, "valid_mask"):
+                valid = output.valid_mask
+
+        return depth, valid
+
+    def _split_panoptic_outputs(
+        self, outputs: Any
+    ) -> tuple[tuple[list[torch.Tensor], list[torch.Tensor]], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Handle flexible outputs that may bundle panoptic logits with depth."""
+
+        depth_pred, valid_mask = None, None
+        panoptic = outputs
+        if isinstance(outputs, dict):
+            panoptic = outputs.get("panoptic", panoptic)
+            depth_pred, valid_mask = self._extract_depth_from_output(outputs)
+
+        if not isinstance(panoptic, (list, tuple)) or len(panoptic) != 2:
+            raise ValueError("Panoptic outputs must be a tuple of (mask_logits, class_logits)")
+
+        return cast(tuple[list[torch.Tensor], list[torch.Tensor]], panoptic), depth_pred, valid_mask
+
+    def depth_teacher_forward(self, batch) -> Dict[str, torch.Tensor]:
+        """Run the frozen depth teacher with lazy initialization."""
+
+        if not self.baseline0_cfg["depth_teacher_ckpt"]:
+            raise ValueError("depth_teacher_ckpt must be set when baseline0 is enabled")
+
+        if self._depth_teacher is None:
+            from third_party.eomt.models.da3_adapter import DA3BackboneAdapter
+
+            if isinstance(getattr(self.network, "encoder", None), DA3BackboneAdapter):
+                teacher = self.network.encoder.build_teacher_copy(self.baseline0_cfg["depth_teacher_ckpt"])
+            else:
+                cfg_path = self.baseline0_cfg.get("depth_teacher_config") or ""
+                teacher = DA3BackboneAdapter(
+                    da3_config_path=cfg_path,
+                    da3_ckpt_path=self.baseline0_cfg["depth_teacher_ckpt"],
+                    lora={"enabled": False},
+                    freeze_depth_head=True,
+                )
+
+            teacher.eval()
+            teacher.requires_grad_(False)
+            self._depth_teacher = teacher.to(self.device)
+
+        imgs = batch[0] if isinstance(batch, (tuple, list)) else batch
+        if imgs.ndim == 4:
+            imgs_teacher = imgs[:, None, ...]
+        else:
+            imgs_teacher = imgs
+
+        imgs_teacher = imgs_teacher.to(self.device)
+
+        with torch.no_grad():
+            depth_t = self._depth_teacher.forward_depth(imgs_teacher)
+        return {"depth_t": depth_t, "valid_mask": None}
+
+    def depth_anchor_loss(
+        self, depth_s: torch.Tensor, depth_t: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute scale-and-shift invariant depth anchor with optional gradient term."""
+
+        if depth_s.dim() == 4:
+            depth_s = depth_s.squeeze(1)
+        if depth_t.dim() == 4:
+            depth_t = depth_t.squeeze(1)
+        if valid_mask is not None and valid_mask.dim() == 4:
+            valid_mask = valid_mask.squeeze(1)
+
+        if valid_mask is None:
+            valid_mask = torch.isfinite(depth_s) & torch.isfinite(depth_t)
+        eps = 1e-6
+
+        losses_ssi, losses_grad = [], []
+        for b in range(depth_s.shape[0]):
+            mask = valid_mask[b]
+            if mask.sum() == 0:
+                losses_ssi.append(torch.tensor(0.0, device=depth_s.device))
+                losses_grad.append(torch.tensor(0.0, device=depth_s.device))
+                continue
+            ds = depth_s[b][mask]
+            dt = depth_t[b][mask]
+            n = ds.numel()
+            sum_ds = ds.sum()
+            sum_dt = dt.sum()
+            sum_ds2 = (ds * ds).sum()
+            sum_dsdt = (ds * dt).sum()
+            denom = n * sum_ds2 - sum_ds**2
+            if torch.abs(denom) < eps:
+                a = torch.tensor(1.0, device=depth_s.device, dtype=depth_s.dtype)
+                b_val = torch.tensor(0.0, device=depth_s.device, dtype=depth_s.dtype)
+            else:
+                a = (n * sum_dsdt - sum_ds * sum_dt) / (denom + eps)
+                b_val = (sum_dt - a * sum_ds) / n
+
+            aligned = a * depth_s[b] + b_val
+            ssi_l1 = torch.mean(torch.abs(aligned[mask] - depth_t[b][mask]))
+
+            grad_s = torch.stack(
+                [
+                    aligned[:, 1:] - aligned[:, :-1],
+                    aligned[1:, :] - aligned[:-1, :],
+                ],
+                dim=0,
+            )
+            grad_t = torch.stack(
+                [
+                    depth_t[b][:, 1:] - depth_t[b][:, :-1],
+                    depth_t[b][1:, :] - depth_t[b][:-1, :],
+                ],
+                dim=0,
+            )
+            if valid_mask is not None:
+                grad_mask = torch.stack(
+                    [
+                        mask[:, 1:] & mask[:, :-1],
+                        mask[1:, :] & mask[:-1, :],
+                    ],
+                    dim=0,
+                )
+                grad_diff = torch.abs(grad_s - grad_t)[grad_mask]
+            else:
+                grad_diff = torch.abs(grad_s - grad_t)
+            grad_l1 = grad_diff.mean() if grad_diff.numel() > 0 else torch.tensor(0.0, device=depth_s.device)
+
+            losses_ssi.append(ssi_l1)
+            losses_grad.append(grad_l1)
+
+        depth_ssi_l1 = torch.stack(losses_ssi).mean()
+        depth_grad_l1 = torch.stack(losses_grad).mean()
+        loss_old = self.baseline0_cfg["lambda_old"] * (
+            depth_ssi_l1 + self.baseline0_cfg["beta_depth_grad"] * depth_grad_l1
+        )
+        stats = {
+            "depth_ssi_l1": depth_ssi_l1.detach(),
+            "depth_grad_l1": depth_grad_l1.detach(),
+            "depth_old_loss": loss_old.detach(),
+        }
+        return loss_old, stats
+
+    def pcgrad_step_on_encoder(
+        self, loss_pan: torch.Tensor, loss_old: torch.Tensor, optimizer: torch.optim.Optimizer
+    ) -> None:
+        """Perform one-sided PCGrad on encoder parameters before stepping."""
+
+        encoder = getattr(self.network, "encoder", None)
+        if encoder is None:
+            raise RuntimeError("Encoder is required for PCGrad updates")
+
+        encoder_params = [p for p in encoder.parameters() if p.requires_grad]
+        optimizer.zero_grad(set_to_none=True)
+
+        # Depth branch
+        self.manual_backward(loss_old, retain_graph=True)
+        g_old = [p.grad.clone().float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32) for p in encoder_params]
+        for p in encoder_params:
+            if p.grad is not None:
+                p.grad = None
+
+        # Panoptic branch (also updates heads)
+        self.manual_backward(loss_pan)
+        g_pan = [p.grad.clone().float() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32) for p in encoder_params]
+
+        dot = torch.stack([torch.dot(gp.flatten(), go.flatten()) for gp, go in zip(g_pan, g_old)]).sum()
+        norm_old_sq = torch.stack([go.flatten().dot(go.flatten()) for go in g_old]).sum()
+
+        conflict_flag = bool((dot < 0).item())
+        if conflict_flag:
+            coef = -dot / (norm_old_sq + self.baseline0_cfg["pcgrad_eps"])
+            for idx, p in enumerate(encoder_params):
+                projected = g_pan[idx] + coef * g_old[idx]
+                p.grad = projected.to(p.dtype)
+        else:
+            for idx, p in enumerate(encoder_params):
+                p.grad = (g_pan[idx] + g_old[idx]).to(p.dtype)
+
+        if self.baseline0_cfg["log_conflict_stats"]:
+            self.log(
+                "pcgrad_conflict",
+                torch.tensor(float(conflict_flag), device=self.device),
+                on_step=True,
+                prog_bar=False,
+            )
+            self.log("pcgrad_dot", dot, on_step=True, prog_bar=False)
+            self.log(
+                "pcgrad_coef",
+                (-dot / (norm_old_sq + self.baseline0_cfg["pcgrad_eps"]))
+                if conflict_flag
+                else torch.tensor(0.0, device=self.device),
+                on_step=True,
+                prog_bar=False,
+            )
+            self.log("pcgrad_norm_old", norm_old_sq.sqrt(), on_step=True, prog_bar=False)
+            self.log(
+                "pcgrad_norm_pan",
+                torch.stack([gp.flatten().dot(gp.flatten()) for gp in g_pan]).sum().sqrt(),
+                on_step=True,
+                prog_bar=False,
+            )
+
+        optimizer.step()
+
+    def configure_optimizers(self):
+        optimizer, scheduler, num_backbone = self._build_optimizer_and_scheduler()
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -218,17 +592,57 @@ class LightningModule(lightning.LightningModule):
                 "interval": "step",
                 "frequency": 1,
             },
+            "monitor": None,
         }
 
-    def forward(self, imgs, **kwargs):
+    def forward(self, imgs, return_depth: bool = False, **kwargs):
         x = imgs / 255.0
+        outputs = self.network(x, **kwargs)
 
-        return self.network(x, **kwargs)
+        if return_depth:
+            depth = None
+            if isinstance(outputs, dict):
+                depth, _ = self._extract_depth_from_output(outputs)
+            if depth is None:
+                depth = self._maybe_forward_depth(x, **kwargs)
+            if depth is not None:
+                return {"panoptic": outputs, "depth": depth}
+
+        return outputs
 
     def training_step(self, batch, batch_idx):
         imgs, targets = batch
 
-        mask_logits_per_block, class_logits_per_block = self(imgs)
+        if not self.baseline0_enabled:
+            mask_logits_per_block, class_logits_per_block = self(imgs)
+
+            losses_all_blocks = {}
+            for i, (mask_logits, class_logits) in enumerate(
+                list(zip(mask_logits_per_block, class_logits_per_block))
+            ):
+                losses = self.criterion(
+                    masks_queries_logits=mask_logits,
+                    class_queries_logits=class_logits,
+                    targets=targets,
+                )
+                block_postfix = self.block_postfix(i)
+                losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
+                losses_all_blocks |= losses
+
+            return self.criterion.loss_total(losses_all_blocks, self.log)
+
+        # Baseline-0 path (manual optimization)
+        optim = self.optimizers()
+        schedulers = self.lr_schedulers()
+        self._freeze_depth_head()
+
+        panoptic_outputs = self(imgs)
+        panoptic_outputs, _, _ = self._split_panoptic_outputs(panoptic_outputs)
+        depth_s = None
+        valid_s = None
+        if hasattr(self.network, "encoder") and hasattr(self.network.encoder, "forward_depth"):
+            depth_s = self.network.encoder.forward_depth(imgs)
+        mask_logits_per_block, class_logits_per_block = panoptic_outputs
 
         losses_all_blocks = {}
         for i, (mask_logits, class_logits) in enumerate(
@@ -242,8 +656,80 @@ class LightningModule(lightning.LightningModule):
             block_postfix = self.block_postfix(i)
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
+        loss_pan = self.criterion.loss_total(losses_all_blocks, self.log)
 
-        return self.criterion.loss_total(losses_all_blocks, self.log)
+        # Teacher depth
+        loss_old = torch.tensor(0.0, device=self.device)
+        depth_stats: Dict[str, torch.Tensor] = {}
+        if self.baseline0_cfg["anchor_on"] == "depth":
+            teacher_out = self.depth_teacher_forward(batch)
+            depth_t = teacher_out["depth_t"]
+            valid_t = teacher_out.get("valid_mask", None)
+
+            if depth_s is None:
+                if not self._warned_missing_depth:
+                    logging.warning("Baseline-0 enabled but student depth head is missing; skipping anchor loss.")
+                    self._warned_missing_depth = True
+            else:
+                if depth_s.ndim == 5:
+                    depth_s = depth_s.view(-1, *depth_s.shape[2:])
+                if valid_s is None:
+                    valid_s = valid_t
+                loss_old, depth_stats = self.depth_anchor_loss(depth_s, depth_t, valid_s if valid_s is not None else valid_t)
+                for key, val in depth_stats.items():
+                    self.log(f"baseline0/{key}", val, on_step=True, on_epoch=True, prog_bar=False)
+
+        total_loss = loss_pan + loss_old
+        warmup = self.baseline0_cfg["warmup_epochs"]
+
+        if self.current_epoch < warmup:
+            self._set_encoder_trainable_layers(0)
+            optim.zero_grad(set_to_none=True)
+            self.manual_backward(loss_pan)
+            optim.step()
+        else:
+            self._set_encoder_trainable_layers(self.baseline0_cfg["unfreeze_encoder_layers"])
+            if self.baseline0_cfg["pcgrad_enabled"]:
+                self.pcgrad_step_on_encoder(loss_pan, loss_old, optim)
+            else:
+                optim.zero_grad(set_to_none=True)
+                self.manual_backward(total_loss)
+                optim.step()
+
+        if schedulers is not None:
+            if isinstance(schedulers, list):
+                for sch in schedulers:
+                    sch.step()
+            else:
+                schedulers.step()
+
+        self.log(
+            "train_loss_panoptic",
+            loss_pan.detach(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        if loss_old is not None:
+            self.log(
+                "train_loss_depth_anchor",
+                loss_old.detach(),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True,
+            )
+        self.log(
+            "train_loss_total",
+            total_loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        return total_loss.detach()
 
     def validation_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "val")

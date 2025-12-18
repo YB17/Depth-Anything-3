@@ -11,6 +11,8 @@ import jsonargparse._typehints as _t
 from types import MethodType
 from gitignore_parser import parse_gitignore
 import logging
+import os
+import sys
 import torch
 import warnings
 from lightning.pytorch import cli
@@ -22,9 +24,12 @@ from training.lightning_module import LightningModule
 from datasets.lightning_data_module import LightningDataModule
 
 # Suppress PyTorch FX warnings for DINOv3 models
-import os
 os.environ["TORCH_LOGS"] = "-dynamo"
 
+# Ensure repo root is on sys.path for depth_anything_3 imports
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 _orig_single = _t.raise_unexpected_value
 
