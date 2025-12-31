@@ -858,11 +858,12 @@ class LightningModule(lightning.LightningModule):
                 student_depth_out = {"depth": depth_s}
         mask_logits_per_block, class_logits_per_block = panoptic_outputs
 
+        # 计算EoMT的segmentation loss; criterion只包含EoMT的loss;
         losses_all_blocks = {}
         for i, (mask_logits, class_logits) in enumerate(
             list(zip(mask_logits_per_block, class_logits_per_block))
         ):
-            losses = self.criterion(
+            losses = self.criterion( # EoMT's loss
                 masks_queries_logits=mask_logits,
                 class_queries_logits=class_logits,
                 targets=targets,
@@ -873,9 +874,12 @@ class LightningModule(lightning.LightningModule):
         loss_pan = self.criterion.loss_total(losses_all_blocks, self.log)
 
         # Teacher depth
+        # 计算Teacher depth的loss;
         loss_old = torch.tensor(0.0, device=self.device)
         depth_stats: Dict[str, torch.Tensor] = {}
         if self.baseline0_cfg["anchor_on"] == "depth":
+            # 调用depth_teacher_forward计算Teacher depth; 
+            # 这里必须要有一次单独的前向和反向传播，以得到Teacher depth的梯度；
             teacher_out = self.depth_teacher_forward(batch)
             depth_t = teacher_out["depth_out"]
             valid_t = teacher_out.get("valid_mask", None)

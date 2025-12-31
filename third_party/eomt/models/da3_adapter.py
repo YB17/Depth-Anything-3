@@ -157,6 +157,7 @@ class _BackboneShim(nn.Module):
         self.num_register_tokens = getattr(vit, "num_register_tokens", 0)
         self.num_prefix_tokens = 1 + self.num_register_tokens
 
+    # ???
     def _pos_embed(self, x: Tensor) -> Tensor:
         B, N, C = x.shape
         cls_token = self.vit.cls_token.expand(B, -1, -1)
