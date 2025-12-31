@@ -148,17 +148,17 @@ class MaskClassificationPanopticDistill(MaskClassificationPanoptic):
             loss_pan = loss_gt + loss_distill
 
             loss_old = torch.tensor(0.0, device=self.device)
-            if hasattr(self.network, "encoder") and hasattr(self.network.encoder, "forward_depth"):
-                depth_s = self.network.encoder.forward_depth(imgs)
-                if depth_s is not None and self.baseline0_cfg["anchor_on"] == "depth":
+            if hasattr(self.network, "encoder"):
+                depth_out = None
+                if hasattr(self.network.encoder, "forward_depth_outputs"):
+                    depth_out = self.network.encoder.forward_depth_outputs(imgs)
+                elif hasattr(self.network.encoder, "forward_depth"):
+                    depth_out = {"depth": self.network.encoder.forward_depth(imgs)}
+                if depth_out is not None and self.baseline0_cfg["anchor_on"] == "depth":
                     teacher_out = self.depth_teacher_forward(batch)
-                    depth_t = teacher_out["depth_t"]
+                    depth_t = teacher_out["depth_out"]
                     valid_t = teacher_out.get("valid_mask", None)
-                    if depth_s.ndim == 5:
-                        depth_s = depth_s.view(-1, *depth_s.shape[2:])
-                    loss_old, stats = self.depth_anchor_loss(
-                        depth_s, depth_t, valid_t
-                    )
+                    loss_old, stats = self.depth_anchor_loss(depth_out, depth_t, valid_t)
                     for key, val in stats.items():
                         self.log(f"baseline0/{key}", val, on_step=True, on_epoch=True, prog_bar=False)
 

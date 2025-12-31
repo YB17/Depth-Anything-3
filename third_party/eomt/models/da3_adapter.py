@@ -232,15 +232,27 @@ class DA3BackboneAdapter(nn.Module):
         raise RuntimeError("DA3BackboneAdapter is not a standalone forward; use within EoMT.")
 
     def forward_depth(self, x: Tensor) -> Tensor:
-        if x.dim() == 4:
-            x = x[:, None, ...]
-        output = self.da3(x)
+        output = self.forward_depth_outputs(x)
         depth = output.get("depth", None) if isinstance(output, dict) else getattr(output, "depth", None)
         if depth is None:
             raise RuntimeError("DA3 model did not return depth.")
         if depth.dim() == 5:
             depth = depth.view(-1, *depth.shape[2:])
         return depth
+
+    def forward_depth_outputs(self, x: Tensor) -> Dict[str, Tensor]:
+        if x.dim() == 4:
+            x = x[:, None, ...]
+        output = self.da3(x)
+        if not isinstance(output, dict):
+            output = output.__dict__ if hasattr(output, "__dict__") else {"depth": getattr(output, "depth", None)}
+        normalized = {}
+        for key, value in output.items():
+            if isinstance(value, Tensor) and value.dim() == 5:
+                normalized[key] = value.view(-1, *value.shape[2:])
+            else:
+                normalized[key] = value
+        return normalized
 
     def get_vit_blocks(self) -> List[nn.Module]:
         return list(self.backbone.blocks)
