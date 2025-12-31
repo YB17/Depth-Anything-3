@@ -178,6 +178,7 @@ class LightningModule(lightning.LightningModule):
             "depth_teacher_config": "",
             "lambda_old": 1.0,
             "beta_depth_grad": 0.5,
+            "lambda_c": 0.1,
             "pcgrad_enabled": True,
             "pcgrad_eps": 1e-12,
             "backbone_lr_mult": 0.1,
@@ -435,90 +436,297 @@ class LightningModule(lightning.LightningModule):
         imgs_teacher = imgs_teacher.to(self.device)
 
         with torch.no_grad():
-            depth_t = self._depth_teacher.forward_depth(imgs_teacher)
-        return {"depth_t": depth_t, "valid_mask": None}
+            if hasattr(self._depth_teacher, "forward_depth_outputs"):
+                depth_out = self._depth_teacher.forward_depth_outputs(imgs_teacher)
+            else:
+                depth_out = {"depth": self._depth_teacher.forward_depth(imgs_teacher)}
+        return {"depth_out": depth_out, "valid_mask": None}
+
+    def _extract_depth(self, output: Any) -> Optional[torch.Tensor]:
+        if output is None:
+            return None
+        if isinstance(output, torch.Tensor):
+            depth = output
+        elif isinstance(output, dict):
+            depth = None
+            for key in ("depth", "pred_depth", "D", "depth_map"):
+                if key in output:
+                    depth = output[key]
+                    break
+        else:
+            depth = getattr(output, "depth", None)
+        if depth is None:
+            return None
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        elif depth.dim() == 5:
+            depth = depth.view(-1, *depth.shape[2:])
+            if depth.dim() == 3:
+                depth = depth.unsqueeze(1)
+        return depth
+
+    def _extract_confidence(self, output: Any, eps: float) -> Optional[torch.Tensor]:
+        if output is None:
+            return None
+        confidence = None
+        if isinstance(output, dict):
+            for key in ("depth_confidence", "confidence", "D_conf", "depth_conf", "depth_confidence_map"):
+                if key in output:
+                    confidence = output[key]
+                    break
+        else:
+            confidence = getattr(output, "depth_confidence", None)
+        if confidence is None:
+            return None
+        if confidence.dim() == 3:
+            confidence = confidence.unsqueeze(1)
+        elif confidence.dim() == 5:
+            confidence = confidence.view(-1, *confidence.shape[2:])
+            if confidence.dim() == 3:
+                confidence = confidence.unsqueeze(1)
+        return confidence.clamp(min=eps, max=1.0)
+
+    def _extract_ray(self, output: Any) -> Optional[Any]:
+        if output is None:
+            return None
+        if isinstance(output, dict):
+            for key in ("ray", "rays", "R", "ray_map"):
+                if key in output:
+                    return output[key]
+        if hasattr(output, "ray"):
+            return output.ray
+        return None
+
+    def _extract_valid_mask(self, output: Any) -> Optional[torch.Tensor]:
+        if output is None:
+            return None
+        if isinstance(output, dict):
+            for key in ("valid_mask", "mask", "m"):
+                if key in output:
+                    return output[key]
+        return None
+
+    def _reshape_ray_tensor(
+        self, ray: torch.Tensor, depth_shape: tuple[int, int, int, int], name: str
+    ) -> torch.Tensor:
+        if ray.dim() == 3:
+            if ray.shape[0] == 3:
+                ray = ray.unsqueeze(0)
+            elif ray.shape[-1] == 3:
+                ray = ray.permute(2, 0, 1).unsqueeze(0)
+            else:
+                raise ValueError(f"Unsupported {name} shape {tuple(ray.shape)}")
+        elif ray.dim() == 4:
+            if ray.shape[1] == 3 or ray.shape[1] == 6:
+                pass
+            elif ray.shape[-1] in (3, 6):
+                ray = ray.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(f"Unsupported {name} shape {tuple(ray.shape)}")
+        elif ray.dim() == 5:
+            if ray.shape[2] in (3, 6):
+                ray = ray.reshape(-1, ray.shape[2], ray.shape[3], ray.shape[4])
+            elif ray.shape[-1] in (3, 6):
+                ray = ray.permute(0, 1, 4, 2, 3).reshape(-1, ray.shape[-1], ray.shape[2], ray.shape[3])
+            else:
+                raise ValueError(f"Unsupported {name} shape {tuple(ray.shape)}")
+        else:
+            raise ValueError(f"Unsupported {name} shape {tuple(ray.shape)}")
+        _, _, H, W = depth_shape
+        if ray.shape[-2:] != (H, W):
+            raise ValueError(f"{name} spatial shape mismatch: {tuple(ray.shape)} vs depth {depth_shape}")
+        return ray
+
+    def _parse_ray(
+        self, ray_obj: Any, depth_shape: tuple[int, int, int, int], normalize_dir: bool = False
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if ray_obj is None:
+            return None, None
+        origin = None
+        direction = None
+        if isinstance(ray_obj, (tuple, list)) and len(ray_obj) == 2:
+            origin, direction = ray_obj
+        elif isinstance(ray_obj, dict):
+            origin = ray_obj.get("origin", ray_obj.get("o", ray_obj.get("t")))
+            direction = ray_obj.get("dir", ray_obj.get("d"))
+        elif isinstance(ray_obj, torch.Tensor):
+            ray = self._reshape_ray_tensor(ray_obj, depth_shape, "ray")
+            if ray.shape[1] == 6:
+                origin, direction = ray[:, :3], ray[:, 3:]
+            elif ray.shape[1] == 3:
+                direction = ray
+            else:
+                raise ValueError(f"Unsupported ray channel count: {ray.shape}")
+        else:
+            raise ValueError(f"Unsupported ray type: {type(ray_obj)}")
+
+        if origin is not None:
+            origin = self._reshape_ray_tensor(origin, depth_shape, "ray_origin")
+        if direction is not None:
+            direction = self._reshape_ray_tensor(direction, depth_shape, "ray_dir")
+
+        if normalize_dir and direction is not None:
+            direction = direction / (direction.norm(dim=1, keepdim=True) + 1e-6)
+        return origin, direction
+
+    def _build_point_map(
+        self, depth: torch.Tensor, origin: Optional[torch.Tensor], direction: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if direction is None:
+            return None
+        if origin is None:
+            return depth * direction
+        return depth * direction + origin
+
+    def _compute_valid_mask(
+        self,
+        depth_t: torch.Tensor,
+        depth_s: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+        *extra_tensors: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if valid_mask is None:
+            mask = torch.ones_like(depth_t[:, :1], dtype=torch.bool)
+        else:
+            mask = valid_mask
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            elif mask.dim() == 5:
+                mask = mask.view(-1, *mask.shape[2:])
+                if mask.dim() == 3:
+                    mask = mask.unsqueeze(1)
+            mask = mask.to(dtype=torch.bool)
+        mask = mask & torch.isfinite(depth_t) & torch.isfinite(depth_s)
+        mask = mask & (depth_t > 0) & (depth_s > 0)
+        for tensor in extra_tensors:
+            if tensor is None:
+                continue
+            finite = torch.isfinite(tensor).all(dim=1, keepdim=True)
+            mask = mask & finite
+        return mask
+
+    def _masked_l1(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, eps: float) -> torch.Tensor:
+        diff = torch.abs(pred - target) * mask
+        denom = mask.sum().clamp_min(eps)
+        return diff.sum() / denom
 
     def depth_anchor_loss(
-        self, depth_s: torch.Tensor, depth_t: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+        self,
+        student_out: Any,
+        teacher_out: Any,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute scale-and-shift invariant depth anchor with optional gradient term."""
+        """Compute DA3-style teacher-anchor loss with common scale normalization."""
 
-        if depth_s.dim() == 4:
-            depth_s = depth_s.squeeze(1)
-        if depth_t.dim() == 4:
-            depth_t = depth_t.squeeze(1)
-        if valid_mask is not None and valid_mask.dim() == 4:
-            valid_mask = valid_mask.squeeze(1)
-
-        if valid_mask is None:
-            valid_mask = torch.isfinite(depth_s) & torch.isfinite(depth_t)
         eps = 1e-6
+        if not isinstance(student_out, dict):
+            student_out = {"depth": student_out}
+        if not isinstance(teacher_out, dict):
+            teacher_out = {"depth": teacher_out}
 
-        losses_ssi, losses_grad = [], []
-        for b in range(depth_s.shape[0]):
-            mask = valid_mask[b]
-            if mask.sum() == 0:
-                losses_ssi.append(torch.tensor(0.0, device=depth_s.device))
-                losses_grad.append(torch.tensor(0.0, device=depth_s.device))
-                continue
-            ds = depth_s[b][mask]
-            dt = depth_t[b][mask]
-            n = ds.numel()
-            sum_ds = ds.sum()
-            sum_dt = dt.sum()
-            sum_ds2 = (ds * ds).sum()
-            sum_dsdt = (ds * dt).sum()
-            denom = n * sum_ds2 - sum_ds**2
-            if torch.abs(denom) < eps:
-                a = torch.tensor(1.0, device=depth_s.device, dtype=depth_s.dtype)
-                b_val = torch.tensor(0.0, device=depth_s.device, dtype=depth_s.dtype)
-            else:
-                a = (n * sum_dsdt - sum_ds * sum_dt) / (denom + eps)
-                b_val = (sum_dt - a * sum_ds) / n
+        depth_s = self._extract_depth(student_out)
+        depth_t = self._extract_depth(teacher_out)
+        if depth_s is None or depth_t is None:
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, {
+                "anc_depth_l1": zero,
+                "anc_depth_grad_l1": zero,
+                "anc_ray_l1": zero,
+                "anc_point_l1": zero,
+                "anc_scale": zero,
+                "anc_old_loss": zero,
+            }
 
-            aligned = a * depth_s[b] + b_val
-            ssi_l1 = torch.mean(torch.abs(aligned[mask] - depth_t[b][mask]))
+        conf_s = self._extract_confidence(student_out, eps)
+        ray_s = self._extract_ray(student_out)
+        ray_t = self._extract_ray(teacher_out)
 
-            grad_s = torch.stack(
-                [
-                    aligned[:, 1:] - aligned[:, :-1],
-                    aligned[1:, :] - aligned[:-1, :],
-                ],
-                dim=0,
-            )
-            grad_t = torch.stack(
-                [
-                    depth_t[b][:, 1:] - depth_t[b][:, :-1],
-                    depth_t[b][1:, :] - depth_t[b][:-1, :],
-                ],
-                dim=0,
-            )
-            if valid_mask is not None:
-                grad_mask = torch.stack(
-                    [
-                        mask[:, 1:] & mask[:, :-1],
-                        mask[1:, :] & mask[:-1, :],
-                    ],
-                    dim=0,
-                )
-                grad_diff = torch.abs(grad_s - grad_t)[grad_mask]
-            else:
-                grad_diff = torch.abs(grad_s - grad_t)
-            grad_l1 = grad_diff.mean() if grad_diff.numel() > 0 else torch.tensor(0.0, device=depth_s.device)
+        valid_mask = valid_mask or self._extract_valid_mask(teacher_out) or self._extract_valid_mask(student_out)
 
-            losses_ssi.append(ssi_l1)
-            losses_grad.append(grad_l1)
+        depth_s = depth_s.to(self.device)
+        depth_t = depth_t.to(self.device)
 
-        depth_ssi_l1 = torch.stack(losses_ssi).mean()
-        depth_grad_l1 = torch.stack(losses_grad).mean()
-        loss_old = self.baseline0_cfg["lambda_old"] * (
-            depth_ssi_l1 + self.baseline0_cfg["beta_depth_grad"] * depth_grad_l1
+        origin_s, dir_s = self._parse_ray(ray_s, depth_s.shape) if ray_s is not None else (None, None)
+        origin_t, dir_t = self._parse_ray(ray_t, depth_t.shape) if ray_t is not None else (None, None)
+
+        if origin_t is not None:
+            origin_t = origin_t.detach()
+        if dir_t is not None:
+            dir_t = dir_t.detach()
+        depth_t = depth_t.detach()
+
+        mask = self._compute_valid_mask(depth_t, depth_s, valid_mask, origin_s, dir_s, origin_t, dir_t)
+        mask_f = mask.float()
+
+        point_t = self._build_point_map(depth_t, origin_t, dir_t)
+        scale_fallback = False
+        if point_t is not None:
+            point_norm = torch.linalg.norm(point_t, dim=1, keepdim=True)
+            scale = (point_norm * mask_f).sum(dim=(2, 3)) / mask_f.sum(dim=(2, 3)).clamp_min(eps)
+        else:
+            scale_fallback = True
+            scale = (depth_t.abs() * mask_f).sum(dim=(2, 3)) / mask_f.sum(dim=(2, 3)).clamp_min(eps)
+        scale = scale.clamp_min(eps).detach().view(-1, 1, 1, 1)
+
+        depth_s_norm = depth_s / scale
+        depth_t_norm = depth_t / scale
+
+        if conf_s is not None:
+            conf_s = conf_s.to(depth_s.device).clamp(min=eps, max=1.0)
+            depth_diff = torch.abs(depth_s_norm - depth_t_norm)
+            depth_term = conf_s * depth_diff - self.baseline0_cfg["lambda_c"] * torch.log(conf_s)
+            depth_l1 = (depth_term * mask_f).sum() / mask_f.sum().clamp_min(eps)
+        else:
+            depth_l1 = self._masked_l1(depth_s_norm, depth_t_norm, mask_f, eps)
+
+        dx_s = depth_s_norm[..., 1:] - depth_s_norm[..., :-1]
+        dx_t = depth_t_norm[..., 1:] - depth_t_norm[..., :-1]
+        dy_s = depth_s_norm[..., 1:, :] - depth_s_norm[..., :-1, :]
+        dy_t = depth_t_norm[..., 1:, :] - depth_t_norm[..., :-1, :]
+        mask_dx = mask[..., 1:] & mask[..., :-1]
+        mask_dy = mask[..., 1:, :] & mask[..., :-1, :]
+        grad_l1 = self._masked_l1(dx_s, dx_t, mask_dx.float(), eps) + self._masked_l1(
+            dy_s, dy_t, mask_dy.float(), eps
         )
+
+        ray_l1 = torch.tensor(0.0, device=depth_s.device)
+        point_l1 = torch.tensor(0.0, device=depth_s.device)
+
+        if dir_s is not None and dir_t is not None:
+            dir_s_norm = dir_s / scale
+            dir_t_norm = dir_t / scale
+            if origin_s is not None and origin_t is not None:
+                ray_s_norm = torch.cat([origin_s / scale, dir_s_norm], dim=1)
+                ray_t_norm = torch.cat([origin_t / scale, dir_t_norm], dim=1)
+                mask_r = mask.expand(-1, 6, -1, -1).float()
+            else:
+                ray_s_norm = dir_s_norm
+                ray_t_norm = dir_t_norm
+                mask_r = mask.expand(-1, 3, -1, -1).float()
+            ray_l1 = self._masked_l1(ray_s_norm, ray_t_norm, mask_r, eps)
+
+        point_s = self._build_point_map(depth_s, origin_s, dir_s)
+        point_t = self._build_point_map(depth_t, origin_t, dir_t)
+        if point_s is not None and point_t is not None:
+            point_s_norm = point_s / scale
+            point_t_norm = point_t / scale
+            mask_p = mask.expand(-1, 3, -1, -1).float()
+            point_l1 = self._masked_l1(point_s_norm, point_t_norm, mask_p, eps)
+
+        loss_old = self.baseline0_cfg["lambda_old"] * (
+            depth_l1 + ray_l1 + point_l1 + self.baseline0_cfg["beta_depth_grad"] * grad_l1
+        )
+
         stats = {
-            "depth_ssi_l1": depth_ssi_l1.detach(),
-            "depth_grad_l1": depth_grad_l1.detach(),
-            "depth_old_loss": loss_old.detach(),
+            "anc_depth_l1": depth_l1.detach(),
+            "anc_depth_grad_l1": grad_l1.detach(),
+            "anc_ray_l1": ray_l1.detach(),
+            "anc_point_l1": point_l1.detach(),
+            "anc_scale": scale.mean().detach(),
+            "anc_old_loss": loss_old.detach(),
         }
+        if scale_fallback:
+            stats["anc_scale_fallback"] = torch.tensor(1.0, device=depth_s.device)
         return loss_old, stats
 
     def pcgrad_step_on_encoder(
@@ -640,8 +848,14 @@ class LightningModule(lightning.LightningModule):
         panoptic_outputs, _, _ = self._split_panoptic_outputs(panoptic_outputs)
         depth_s = None
         valid_s = None
-        if hasattr(self.network, "encoder") and hasattr(self.network.encoder, "forward_depth"):
-            depth_s = self.network.encoder.forward_depth(imgs)
+        student_depth_out = None
+        if hasattr(self.network, "encoder"):
+            encoder = self.network.encoder
+            if hasattr(encoder, "forward_depth_outputs"):
+                student_depth_out = encoder.forward_depth_outputs(imgs)
+            elif hasattr(encoder, "forward_depth"):
+                depth_s = encoder.forward_depth(imgs)
+                student_depth_out = {"depth": depth_s}
         mask_logits_per_block, class_logits_per_block = panoptic_outputs
 
         losses_all_blocks = {}
@@ -663,19 +877,21 @@ class LightningModule(lightning.LightningModule):
         depth_stats: Dict[str, torch.Tensor] = {}
         if self.baseline0_cfg["anchor_on"] == "depth":
             teacher_out = self.depth_teacher_forward(batch)
-            depth_t = teacher_out["depth_t"]
+            depth_t = teacher_out["depth_out"]
             valid_t = teacher_out.get("valid_mask", None)
 
-            if depth_s is None:
+            if student_depth_out is None:
                 if not self._warned_missing_depth:
                     logging.warning("Baseline-0 enabled but student depth head is missing; skipping anchor loss.")
                     self._warned_missing_depth = True
             else:
-                if depth_s.ndim == 5:
-                    depth_s = depth_s.view(-1, *depth_s.shape[2:])
                 if valid_s is None:
                     valid_s = valid_t
-                loss_old, depth_stats = self.depth_anchor_loss(depth_s, depth_t, valid_s if valid_s is not None else valid_t)
+                loss_old, depth_stats = self.depth_anchor_loss(
+                    student_depth_out,
+                    depth_t,
+                    valid_s if valid_s is not None else valid_t,
+                )
                 for key, val in depth_stats.items():
                     self.log(f"baseline0/{key}", val, on_step=True, on_epoch=True, prog_bar=False)
 
